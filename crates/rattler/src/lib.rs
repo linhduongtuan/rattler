@@ -1,4 +1,5 @@
 mod channel;
+mod environment_spec;
 mod match_spec;
 mod match_spec_constraints;
 mod platform;
@@ -19,5 +20,7 @@ pub use repo_data::{ChannelInfo, NoArchType, PackageRecord, RepoData};
 pub use solver::{PackageIndex, SolverIndex};
 pub use version::{ParseVersionError, ParseVersionErrorKind, Version};
 pub use version_spec::VersionSpec;
+
+pub use environment_spec::EnvironmentSpec;
 
 use range::Range;

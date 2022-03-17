@@ -21,7 +21,7 @@ pub struct Opt {
     channels: Option<Vec<String>>,
 
     #[structopt(required = true)]
-    specs: Vec<String>
+    specs: Vec<String>,
 }
 
 pub async fn create(opt: Opt) -> anyhow::Result<()> {
@@ -53,7 +53,7 @@ pub async fn create(opt: Opt) -> anyhow::Result<()> {
         sha256: None,
         arch: None,
         platform: None,
-        depends: vec![String::from("ros-noetic-rviz")],//opt.specs,
+        depends: vec![String::from("mamba")], //opt.specs,
         constrains: vec![],
         track_features: None,
         features: None,

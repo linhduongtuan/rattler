@@ -13,6 +13,7 @@ struct Opt {
 #[derive(Debug, StructOpt)]
 enum Command {
     Create(commands::create::Opt),
+    Install(commands::install::Opt),
 }
 
 /// Entry point of the `rattler` cli.
@@ -23,5 +24,6 @@ async fn main() -> anyhow::Result<()> {
     let opt = Opt::from_args();
     match opt.command {
         Command::Create(opt) => commands::create::create(opt).await,
+        Command::Install(opt) => commands::install::install(opt).await,
     }
 }
