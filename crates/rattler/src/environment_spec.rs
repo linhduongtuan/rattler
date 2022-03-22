@@ -9,14 +9,16 @@ use tokio::fs::File;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::pin;
 use tokio_stream::wrappers::LinesStream;
+use url::Url;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EnvironmentSpec {
     Explicit(ExplicitEnvironment),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExplicitEnvironment {
-    specs: HashSet<ExplicitSpec>,
+    pub specs: HashSet<ExplicitPackageSpec>,
 }
 
 impl EnvironmentSpec {
@@ -58,16 +60,49 @@ impl ExplicitEnvironment {
 }
 
 #[derive(Debug, Clone, Error)]
-enum ParseExplicitSpecError {}
+pub enum ParseExplicitSpecError {
+    #[error("cannot parse url: {0}")]
+    UrlParseError(#[from] url::ParseError),
+}
 
 #[derive(Clone, Eq, PartialEq, Hash, Debug)]
-struct ExplicitSpec {}
+pub struct ExplicitPackageSpec {
+    url: Url,
+}
 
-impl FromStr for ExplicitSpec {
+impl FromStr for ExplicitPackageSpec {
     type Err = ParseExplicitSpecError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        dbg!(s);
-        Ok(ExplicitSpec {})
+        Ok(ExplicitPackageSpec {
+            url: Url::parse(s)?,
+        })
+    }
+}
+
+impl ExplicitPackageSpec {
+    /// Returns the Url of this instance
+    pub fn url(&self) -> &Url {
+        &self.url
+    }
+
+    /// Returns the expected MD5 hash if specified
+    pub fn md5(&self) -> Option<&str> {
+        self.url.fragment()
+    }
+}
+
+impl crate::install::Package for ExplicitPackageSpec {
+    fn filename(&self) -> &str {
+        self.url
+            .path_segments()
+            .into_iter()
+            .flatten()
+            .last()
+            .expect("invalid url without path")
+    }
+
+    fn url(&self) -> &Url {
+        &self.url
     }
 }
