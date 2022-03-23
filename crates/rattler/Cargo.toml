@@ -9,8 +9,9 @@ edition = "2018"
 anyhow = "1.0.44"
 structopt = "0.3.25"
 tokio = { version = "1.12.0", features = ["full", "io-util"] }
-tokio-util = { version = "0.6.9", features = ["codec"] }
+tokio-util = { version = "0.6.9", features = ["codec", "compat"] }
 tokio-stream = { version="0.1.8", features=["io-util"] }
+tokio-tar = { version="0.3.0", git="https://github.com/vorot93/tokio-tar" }
 futures = "0.3.17"
 serde = { version = "1.0.130", features = ["derive"] }
 serde_json = { version="1.0.68", features=["raw_value"] }
@@ -35,9 +36,10 @@ derive_more = "0.99.16"
 void = "1.0.2"
 nom = "7.1.0"
 dirs = "4.0.0"
-async-compression = {version="0.3.12", features=["gzip", "futures-bufread"] }
+async-compression = {version="0.3.12", features=["gzip", "bzip2", "futures-bufread"] }
 log = "0.4.14"
 pretty_env_logger = "0.4.0"
+tempdir = "0.3.7"
 
 [dev-dependencies]
 rand = "0.8.4"
