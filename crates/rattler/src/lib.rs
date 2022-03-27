@@ -3,6 +3,7 @@ mod environment_spec;
 pub mod install;
 mod match_spec;
 mod match_spec_constraints;
+mod package_archive;
 mod platform;
 mod range;
 mod repo_data;

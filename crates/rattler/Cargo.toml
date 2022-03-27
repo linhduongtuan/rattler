@@ -39,7 +39,8 @@ dirs = "4.0.0"
 async-compression = {version="0.3.12", features=["gzip", "bzip2", "futures-bufread", "tokio"] }
 log = "0.4.14"
 pretty_env_logger = "0.4.0"
-tempdir = "0.3.7"
+async-once-cell = "0.3.0"
+sha2 = "0.10.2"
 
 [dev-dependencies]
 rand = "0.8.4"

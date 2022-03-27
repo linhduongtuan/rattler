@@ -1,0 +1,5 @@
+# This file may be used to create an environment using:
+# $ conda create --name <env> --file <this file>
+# platform: win-64
+@EXPLICIT
+https://repo.anaconda.com/pkgs/main/win-64/vc-14.1-h0510ff6_4.conda#dc9507a39ab328597820486c729cd279
