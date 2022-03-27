@@ -1,5 +1,5 @@
+use rattler::{install_prefix, EnvironmentSpec};
 use std::env::current_dir;
-use rattler::{EnvironmentSpec, ExplicitPackageSpec, install, install_prefix};
 use std::path::PathBuf;
 use structopt::StructOpt;
 
@@ -23,7 +23,12 @@ pub async fn install(opt: Opt) -> anyhow::Result<()> {
         .join("pkgs");
     log::debug!("packages cache dir: {}", cache_dir.display());
 
-    install_prefix(explicit_environment.specs.into_iter(), &prefix_dir, cache_dir).await?;
+    install_prefix(
+        explicit_environment.specs.into_iter(),
+        &prefix_dir,
+        cache_dir,
+    )
+    .await?;
 
     Ok(())
 }

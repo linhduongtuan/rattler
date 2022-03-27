@@ -1,7 +1,5 @@
 use futures::{future, StreamExt, TryStreamExt};
 use std::collections::HashSet;
-use std::ffi::OsStr;
-use std::io::Error;
 use std::path::Path;
 use std::str::FromStr;
 use thiserror::Error;
@@ -34,7 +32,7 @@ impl EnvironmentSpec {
 impl ExplicitEnvironment {
     pub async fn from_file(path: impl AsRef<Path>) -> anyhow::Result<Self> {
         let file = File::open(path).await?;
-        let mut lines = LinesStream::new(BufReader::new(file).lines())
+        let lines = LinesStream::new(BufReader::new(file).lines())
             .try_filter(|line| future::ready(!line.starts_with('#')))
             .map_err(|err| anyhow::Error::from(err));
 

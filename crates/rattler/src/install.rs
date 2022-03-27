@@ -1,24 +1,17 @@
-use crate::ExplicitPackageSpec;
-use async_compression::futures::bufread::BzDecoder;
+use anyhow::Context;
 use bytes::Bytes;
-use futures::{future, SinkExt, Stream, StreamExt, TryFutureExt, TryStreamExt};
-use http_cache_reqwest::{Cache, CacheMode, HttpCache};
+use futures::{future, Stream, TryStreamExt};
 use itertools::Itertools;
-use once_cell::sync::{Lazy, OnceCell};
+use once_cell::sync::Lazy;
 use reqwest_middleware::{ClientBuilder, ClientWithMiddleware};
 use reqwest_retry::policies::ExponentialBackoff;
 use reqwest_retry::RetryTransientMiddleware;
-use std::collections::{HashMap, HashSet};
-use std::ffi::OsStr;
-use std::io::{ErrorKind, Write};
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
-use tempdir::TempDir;
-use tokio::fs::File;
+use tokio::fs;
 use tokio::io;
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio_tar::Archive;
-use tokio_util::compat::FuturesAsyncReadCompatExt;
+use tokio_util::io::StreamReader;
 use url::Url;
 
 pub trait Package {
@@ -52,21 +45,24 @@ pub async fn install_prefix<P: Package>(
     prefix: impl AsRef<Path>,
     package_cache_path: impl AsRef<Path>,
 ) -> anyhow::Result<()> {
-    let package_cache_path = package_cache_path.as_ref();
+    let package_cache_path = package_cache_path.as_ref().to_path_buf();
     tokio::fs::create_dir_all(&package_cache_path).await?;
 
     let client: Lazy<ClientWithMiddleware> = Lazy::new(construct_client);
     let packages = packages.into_iter().collect_vec();
 
     // Download all the package archives
-    future::try_join_all(packages.iter().map(|package| {
+    let _result: Vec<_> = future::try_join_all(packages.iter().map(|package| {
+        let package_cache_path = package_cache_path.clone();
+        let archive_file_name = package.filename().to_owned();
+        let source_url = package.url().clone();
         let client = client.deref().clone();
-        download(
+        tokio::spawn(fetch_and_extract(
             client,
-            package.filename(),
-            package.url(),
+            archive_file_name,
+            source_url,
             package_cache_path,
-        )
+        ))
     }))
     .await?;
 
@@ -75,49 +71,27 @@ pub async fn install_prefix<P: Package>(
     Ok(())
 }
 
-/// Modifies the given path to end in .tmp
-fn build_temporary_file_path(path: impl AsRef<Path>) -> PathBuf {
+/// Ensures there is a clean directory at the specified location, this means that there is a
+/// directory which doesnt contain anything.
+async fn create_clean_dir_all(path: impl AsRef<Path>) -> io::Result<()> {
     let path = path.as_ref();
-    let new_extension = path
-        .extension()
-        .map(|ext| format!("{}.tmp", ext.to_string_lossy()))
-        .unwrap_or_else(|| String::from("tmp"));
-    path.with_extension(new_extension)
-}
-
-async fn stream_response(
-    mut reader: impl Stream<Item = reqwest::Result<Bytes>> + Unpin,
-    mut writer: impl AsyncWrite + Unpin,
-) -> anyhow::Result<()> {
-    while let Some(bytes) = reader.next().await {
-        let bytes = bytes?;
-        writer
-            .write_all(bytes.as_ref())
-            .await
-            .map_err(|e| anyhow::anyhow!("write_all failed: {e}"))?;
+    if path.is_dir() {
+        fs::remove_dir_all(path).await?;
+    } else if path.is_file() {
+        fs::remove_file(path).await?;
     }
-    Ok(())
+    fs::create_dir_all(path).await
 }
 
 /// Downloads the specified package to a package cache directory. This function always overwrites
 /// whatever was there.
-async fn download(
+async fn fetch_and_extract(
     client: ClientWithMiddleware,
-    package_file_name: &str,
-    package_url: &Url,
-    package_cache_directory: &Path,
-) -> anyhow::Result<Option<PathBuf>> {
-    let package_identifier = if let Some(package_identifier) = package_file_name.strip_suffix(".tar.bz2") {
-        package_identifier
-    } else {
-        return Ok(None)
-    };
-
-    // Determine the final location of the archive and delete it if it exists
-    let archive_file_path = package_cache_directory.join(package_identifier);
-    if archive_file_path.is_dir() {
-        tokio::fs::remove_dir_all(&archive_file_path).await?;
-    }
+    package_file_name: String,
+    package_url: Url,
+    package_cache_directory: PathBuf,
+) -> anyhow::Result<()> {
+    let lower_case_package_name = package_file_name.to_lowercase();
 
     // Start downloading the package
     let response = client
@@ -126,25 +100,40 @@ async fn download(
         .await?
         .error_for_status()?;
 
-    // Construct stream of bytes from the remote
-    let bytes = response
-        .bytes_stream()
-        .map_err(|e| std::io::Error::new(ErrorKind::Other, e))
-        .into_async_read();
+    // Construct stream of byte chunks from the download
+    let bytes = response.bytes_stream();
 
-    // Determine the archive location
-    let tmp_dir = TempDir::new_in(&package_cache_directory, &format!(".{package_identifier}.tmp"))?;
+    // Extract the contents of the package
+    let destination = if let Some(package_name) = lower_case_package_name.strip_suffix(".tar.bz2") {
+        let destination = package_cache_directory.join(package_name);
+        create_clean_dir_all(&destination).await?;
+        extract_tar_bz2(bytes, &destination.clone())
+            .await
+            .with_context(|| {
+                format!(
+                    "while unpacking tar.bz2 archive to {}",
+                    destination.display()
+                )
+            })?;
+        destination
+    } else {
+        anyhow::bail!("unknown package extension for `{}`", package_file_name);
+    };
 
-    // Extract the contents of the archive while reading the stream
-    Archive::new(BzDecoder::new(bytes).compat())
-        .unpack(tmp_dir.path())
-        .map_err(|e| anyhow::anyhow!("failed to extract: {e}"))
-        .await?;
+    // Report success
+    log::debug!("extracted {package_url} to {}", destination.display());
 
-    // Rename the temporary directory to the final archive location
-    tokio::fs::rename(tmp_dir, &archive_file_path).await?;
+    Ok(())
+}
 
-    log::debug!("extracted {package_file_name} to {}", archive_file_path.display());
-
-    Ok(Some(archive_file_path))
+/// Extracts a `.tar.bz2` archive to the specified destination
+async fn extract_tar_bz2(
+    bytes: impl Stream<Item = reqwest::Result<Bytes>> + Unpin,
+    destination: &Path,
+) -> anyhow::Result<()> {
+    let decompressed_bytes = async_compression::tokio::bufread::BzDecoder::new(StreamReader::new(
+        bytes.map_err(|e| io::Error::new(io::ErrorKind::Other, e)),
+    ));
+    Archive::new(decompressed_bytes).unpack(destination).await?;
+    Ok(())
 }
