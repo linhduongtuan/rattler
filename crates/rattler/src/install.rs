@@ -53,15 +53,11 @@ pub async fn install_prefix<P: Package>(
 
     // Download all the package archives
     let _result: Vec<_> = future::try_join_all(packages.iter().map(|package| {
-        let package_cache_path = package_cache_path.clone();
-        let archive_file_name = package.filename().to_owned();
-        let source_url = package.url().clone();
-        let client = client.deref().clone();
         tokio::spawn(fetch_and_extract(
-            client,
-            archive_file_name,
-            source_url,
-            package_cache_path,
+            client.deref().clone(),
+            package.filename().to_owned(),
+            package.url().clone(),
+            package_cache_path.clone(),
         ))
     }))
     .await?;
