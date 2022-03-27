@@ -13,6 +13,7 @@ use std::sync::Arc;
 use thiserror::Error;
 use tokio::fs;
 use tokio::io;
+use tokio::io::{AsyncBufRead, BufReader};
 use tokio_stream::StreamExt;
 use tokio_tar::Archive;
 use tokio_util::codec::{BytesCodec, FramedRead};
@@ -101,25 +102,19 @@ async fn ensure_package_archive(
     }
 
     // Clean the previous directory to ensure no files remain
-    create_clean_dir_all(&destination).await?;
+    if destination.is_dir() {
+        fs::remove_dir_all(&destination).await?;
+    } else if destination.is_file() {
+        fs::remove_file(&destination).await?;
+    }
 
     // Download the package
     let client = (**client).clone();
-    fetch_and_extract(client, url.clone(), format, destination.clone()).await?;
+    fetch_and_extract(client, url.clone(), format, destination.clone())
+        .await
+        .with_context(|| format!("failed to download and extract {}", &package_file_name))?;
 
     Ok(destination)
-}
-
-/// Ensures there is a clean directory at the specified location, this means that there is a
-/// directory which doesnt contain anything.
-async fn create_clean_dir_all(path: impl AsRef<Path>) -> io::Result<()> {
-    let path = path.as_ref();
-    if path.is_dir() {
-        fs::remove_dir_all(path).await?;
-    } else if path.is_file() {
-        fs::remove_file(path).await?;
-    }
-    fs::create_dir_all(path).await
 }
 
 /// Downloads the specified package to a package cache directory. This function always overwrites
@@ -139,9 +134,10 @@ async fn fetch_and_extract(
 
     // Construct stream of byte chunks from the download
     let bytes = response.bytes_stream();
+    let byte_stream = StreamReader::new(bytes.map_err(|e| io::Error::new(io::ErrorKind::Other, e)));
 
     // Extract the contents of the package
-    format.unpack(bytes, &destination).await?;
+    format.unpack(byte_stream, &destination).await?;
 
     // Report success
     log::debug!("extracted {package_url} to {}", destination.display());
@@ -151,22 +147,61 @@ async fn fetch_and_extract(
 
 /// Extracts a `.tar.bz2` archive to the specified destination
 async fn extract_tar_bz2(
-    bytes: impl Stream<Item = reqwest::Result<Bytes>> + Unpin,
+    bytes: impl AsyncBufRead + Send + Unpin,
     destination: &Path,
 ) -> anyhow::Result<()> {
-    let decompressed_bytes = async_compression::tokio::bufread::BzDecoder::new(StreamReader::new(
-        bytes.map_err(|e| io::Error::new(io::ErrorKind::Other, e)),
-    ));
+    let decompressed_bytes = async_compression::tokio::bufread::BzDecoder::new(bytes);
+    Archive::new(decompressed_bytes).unpack(destination).await?;
+    Ok(())
+}
+
+/// Extracts a `.tar.zstd` archive to the specified destination
+async fn extract_tar_zstd(
+    bytes: impl AsyncBufRead + Send + Unpin,
+    destination: &Path,
+) -> anyhow::Result<()> {
+    let decompressed_bytes = async_compression::tokio::bufread::ZstdDecoder::new(bytes);
     Archive::new(decompressed_bytes).unpack(destination).await?;
     Ok(())
 }
 
 /// Extracts a `.conda` archive to the specified destination
 async fn extract_conda(
-    bytes: impl Stream<Item = reqwest::Result<Bytes>> + Unpin,
+    bytes: impl AsyncBufRead + Send + Unpin,
     destination: &Path,
 ) -> anyhow::Result<()> {
-    Err(anyhow::anyhow!("unsupported"))
+    let mut zip_reader = async_zip::read::stream::ZipFileReader::new(bytes);
+    while let Some(mut entry) = zip_reader
+        .entry_reader()
+        .await
+        .with_context(|| format!("failed to read zip entry"))?
+    {
+        let entry_name = entry.entry().name();
+
+        // Skip metadata
+        if entry_name == "metadata.json" {
+            entry.read_to_end_crc().await?;
+            continue;
+        }
+
+        let (_, archive_format) = PackageArchiveFormat::from_file_name(entry_name)
+            .ok_or_else(|| anyhow::anyhow!("unknown archive format for `{entry_name}`"))?;
+
+        let buf_reader = BufReader::new(&mut entry);
+        match archive_format {
+            PackageArchiveFormat::TarBz2 => extract_tar_bz2(buf_reader, destination).await?,
+            PackageArchiveFormat::TarZst => extract_tar_zstd(buf_reader, destination).await?,
+            PackageArchiveFormat::Conda => {
+                anyhow::bail!("conda archive cannot contain more conda archives")
+            }
+        }
+
+        if !entry.compare_crc() {
+            anyhow::bail!("CRC of zip entry does not match read content")
+        }
+    }
+
+    Ok(())
 }
 
 #[derive(Debug, Error)]
@@ -192,7 +227,7 @@ enum ValidationError {
     #[error("`{0}` digest mismatch, expected {1}, got {2}")]
     DigestMismatch(String, String, String),
 
-    #[error("unknown error")]
+    #[error("{0}")]
     Unknown(#[source] anyhow::Error),
 }
 
@@ -240,7 +275,6 @@ async fn validate_package_entry(
     let digest = compute_sha256_digest(&entry_path)
         .await
         .map_err(|e| ValidationError::DigestError(e))?;
-
     if entry.sha256 != digest {
         return Err(ValidationError::DigestMismatch(
             entry.relative_path.display().to_string(),
@@ -279,6 +313,7 @@ async fn validate_package(archive_path: &PathBuf) -> Result<(), ValidationError>
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
 enum PackageArchiveFormat {
     TarBz2,
+    TarZst,
     Conda,
 }
 
@@ -288,8 +323,10 @@ impl PackageArchiveFormat {
     pub fn from_file_name(file_name: &str) -> Option<(&str, Self)> {
         if let Some(name) = file_name.strip_suffix(".tar.bz2") {
             Some((name, PackageArchiveFormat::TarBz2))
-        // } else if let Some(name) = file_name.strip_suffix(".conda") {
-        //     Some((name, PackageArchiveFormat::Conda))
+        } else if let Some(name) = file_name.strip_suffix(".conda") {
+            Some((name, PackageArchiveFormat::Conda))
+        } else if let Some(name) = file_name.strip_suffix(".tar.zst") {
+            Some((name, PackageArchiveFormat::TarZst))
         } else {
             None
         }
@@ -298,12 +335,13 @@ impl PackageArchiveFormat {
     /// Given an archive data stream extract the contents to a specific location
     pub async fn unpack(
         &self,
-        bytes: impl Stream<Item = reqwest::Result<Bytes>> + Unpin,
+        bytes: impl AsyncBufRead + Send + Unpin,
         destination: &Path,
     ) -> anyhow::Result<()> {
         match self {
             PackageArchiveFormat::TarBz2 => extract_tar_bz2(bytes, destination).await,
             PackageArchiveFormat::Conda => extract_conda(bytes, destination).await,
+            PackageArchiveFormat::TarZst => extract_tar_zstd(bytes, destination).await,
         }
     }
 }
