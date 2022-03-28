@@ -94,7 +94,7 @@ async fn ensure_package_archive(
     if destination.is_dir() {
         match validate_package(&destination).await {
             Ok(()) => {
-                log::debug!("contents of `{}` succesfully validated", &package_file_name);
+                log::trace!("contents of `{}` succesfully validated", &package_file_name);
                 return Ok(destination);
             }
             Err(e) => log::warn!("contents of `{}` is invalid: {e}", &package_file_name),
@@ -218,6 +218,9 @@ enum ValidationError {
     #[error("`{0}` is not a file")]
     NotAFile(String),
 
+    #[error("cannot read link '{0}': {1}")]
+    NotALink(String, #[source] io::Error),
+
     #[error("`{0}` size mismatch: exptected {1}, got {2}")]
     FileSizeMismatch(String, u64, u64),
 
@@ -252,6 +255,26 @@ async fn validate_package_entry(
     entry: PathEntry,
 ) -> Result<(), ValidationError> {
     let entry_path = archive_path.join(&entry.relative_path);
+
+    if entry.path_type == "softlink" {
+        let link_path = tokio::fs::read_link(&entry_path)
+            .await
+            .map_err(|e| ValidationError::NotALink(entry.relative_path.display().to_string(), e))?;
+
+        // FIXME: This doesnt work, what is the content of the hash??
+        // let mut ctx = Sha256::new();
+        // ctx.update(link_path.into_os_string().into_string().unwrap().as_bytes());
+        // let digest = format!("{:x}", ctx.finalize());
+        // if digest != entry.sha256 {
+        //     return Err(ValidationError::DigestMismatch(
+        //         entry.relative_path.display().to_string(),
+        //         entry.sha256.clone(),
+        //         digest,
+        //     ));
+        // }
+        return Ok(());
+    }
+
     let metadata = tokio::fs::metadata(&entry_path).await.map_err(|e| {
         ValidationError::FileMetaDataError(entry.relative_path.display().to_string(), e)
     })?;
@@ -272,16 +295,17 @@ async fn validate_package_entry(
         ));
     }
 
-    let digest = compute_sha256_digest(&entry_path)
-        .await
-        .map_err(|e| ValidationError::DigestError(e))?;
-    if entry.sha256 != digest {
-        return Err(ValidationError::DigestMismatch(
-            entry.relative_path.display().to_string(),
-            entry.sha256.clone(),
-            digest,
-        ));
-    }
+    // TODO: Enable or disable?
+    // let digest = compute_sha256_digest(&entry_path)
+    //     .await
+    //     .map_err(|e| ValidationError::DigestError(e))?;
+    // if entry.sha256 != digest {
+    //     return Err(ValidationError::DigestMismatch(
+    //         entry.relative_path.display().to_string(),
+    //         entry.sha256.clone(),
+    //         digest,
+    //     ));
+    // }
 
     Ok(())
 }
@@ -298,14 +322,9 @@ async fn validate_package(archive_path: &PathBuf) -> Result<(), ValidationError>
         serde_json::from_reader(paths_file).map_err(ValidationError::CouldNotDeserializePaths)?;
 
     // Iterate over all files and determine whether they are valid
-    let _result = future::try_join_all(
-        paths
-            .paths
-            .iter()
-            .map(|entry| validate_package_entry(archive_path.to_path_buf(), entry.clone()))
-            .map(|e| tokio::spawn(e).unwrap_or_else(|e| Err(ValidationError::Unknown(e.into())))),
-    )
-    .await?;
+    for entry in paths.paths.iter() {
+        validate_package_entry(archive_path.to_path_buf(), entry.clone()).await?;
+    }
 
     Ok(())
 }
