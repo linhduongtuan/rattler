@@ -1,0 +1,5 @@
+# This file may be used to create an environment using:
+# $ conda create --name <env> --file <this file>
+# platform: linux-64
+@EXPLICIT
+https://conda.anaconda.org/robostack/linux-64/ros-noetic-visualization-msgs-1.13.1-py39h6fdeb60_13.tar.bz2

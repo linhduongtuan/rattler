@@ -11,7 +11,7 @@ structopt = "0.3.25"
 tokio = { version = "1.12.0", features = ["full", "io-util"] }
 tokio-util = { version = "0.6.9", features = ["codec", "compat"] }
 tokio-stream = { version="0.1.8", features=["io-util"] }
-tokio-tar = { version="0.3.0", git="https://github.com/vorot93/tokio-tar" }
+tokio-tar = { version="0.3.0", git="https://github.com/baszalmstra/tokio-tar", branch="fix/attempt_to_subtract_with_overflow"}
 futures = "0.3.17"
 serde = { version = "1.0.130", features = ["derive"] }
 serde_json = { version="1.0.68", features=["raw_value"] }
