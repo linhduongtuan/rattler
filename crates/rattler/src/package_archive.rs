@@ -38,7 +38,56 @@ pub struct Paths {
 pub struct PathEntry {
     #[serde(rename = "_path")]
     pub relative_path: PathBuf,
-    pub path_type: String,
+    pub path_type: PathType,
     pub sha256: String,
     pub size_in_bytes: u64,
+
+    #[serde(default, skip_serializing_if = "FileMode::is_binary")]
+    pub file_mode: FileMode,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefix_placeholder: Option<String>,
+
+    #[serde(
+        default = "no_link_default",
+        skip_serializing_if = "is_no_link_default"
+    )]
+    pub no_link: bool,
+}
+
+#[serde(rename_all = "lowercase")]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Hash)]
+pub enum FileMode {
+    Binary,
+    Text,
+}
+
+#[serde(rename_all = "lowercase")]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Hash)]
+pub enum PathType {
+    HardLink,
+    SoftLink,
+    Directory,
+}
+
+impl Default for FileMode {
+    fn default() -> Self {
+        FileMode::Binary
+    }
+}
+
+impl FileMode {
+    fn is_binary(&self) -> bool {
+        matches!(self, FileMode::Binary)
+    }
+}
+
+/// Returns the default value for the "no_link" value of a [`PathEntry`]
+fn no_link_default() -> bool {
+    false
+}
+
+/// Returns true if the value is equal to the default value for the "no_link" value of a [`PathEntry`]
+fn is_no_link_default(value: &bool) -> bool {
+    *value == no_link_default()
 }

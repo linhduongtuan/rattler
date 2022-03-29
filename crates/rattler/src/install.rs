@@ -1,4 +1,4 @@
-use crate::package_archive::{Index, PathEntry, Paths};
+use crate::package_archive::{FileMode, Index, PathEntry, PathType, Paths};
 use anyhow::Context;
 use bytes::Bytes;
 use futures::stream::FuturesUnordered;
@@ -52,6 +52,7 @@ pub async fn install_prefix<P: Package>(
     prefix: impl AsRef<Path>,
     package_cache_path: impl AsRef<Path>,
 ) -> anyhow::Result<()> {
+    let prefix = prefix.as_ref().to_path_buf();
     let package_cache_path = package_cache_path.as_ref().to_path_buf();
     tokio::fs::create_dir_all(&package_cache_path).await?;
 
@@ -61,8 +62,10 @@ pub async fn install_prefix<P: Package>(
     // Create tasks to download all packages
     let mut download_tasks = FuturesUnordered::new();
     for package in packages.iter() {
+        let prefix = prefix.clone();
         let package_name = package.filename();
         let package_task = tokio::spawn(install_package(
+            prefix,
             package_name.to_owned(),
             package.url().clone(),
             client.clone(),
@@ -82,6 +85,7 @@ pub async fn install_prefix<P: Package>(
 }
 
 pub async fn install_package(
+    prefix: PathBuf,
     package_file_name: String,
     url: Url,
     client: LazyClient,
@@ -91,18 +95,158 @@ pub async fn install_package(
     let archive_path =
         ensure_package_archive(&package_file_name, &url, client, &package_cache_path).await?;
 
-    // Determine the dependencies from the archive
-    let index: Index = tokio::task::block_in_place(|| {
-        std::fs::File::open(&archive_path.join("info/index.json"))
-            .map_err(anyhow::Error::new)
-            .and_then(|f| {
-                serde_json::from_reader(std::io::BufReader::new(f)).map_err(anyhow::Error::new)
-            })
-    })
-    .with_context(|| format!("unable to read info/index.json"))?;
-    let dependencies = index.depends;
+    // Read the contents of the index.json file
+    let index: Index = tokio::task::block_in_place(|| read_index_from_archive(&archive_path))?;
+
+    // Read the contents of the paths.json file
+    let paths: Paths = tokio::task::block_in_place(|| read_paths_from_archive(&archive_path))?;
+
+    // Install all files
+    let mut link_tasks = FuturesUnordered::new();
+    for entry in paths.paths.iter() {
+        let relative_path = entry.relative_path.clone();
+        let link_future = link_entry(&archive_path, &prefix, entry).map(|r| {
+            r.with_context(move || format!("error linking `{}`", relative_path.display()))
+        });
+        link_tasks.push(link_future);
+    }
+
+    // Wait for all tasks to complete
+    while let Some(link_task) = link_tasks.next().await {
+        let _ = link_task?;
+    }
 
     Ok(())
+}
+
+/// Reads the contents of the paths.json file from a package cache. Because parsing a json file is
+/// blocking, this call is blocking.
+fn read_paths_from_archive(archive_path: &Path) -> anyhow::Result<Paths> {
+    std::fs::File::open(&archive_path.join("info/paths.json"))
+        .map_err(anyhow::Error::new)
+        .and_then(|f| {
+            serde_json::from_reader(std::io::BufReader::new(f)).map_err(anyhow::Error::new)
+        })
+}
+
+/// Reads the contents of the index.json file from a package cache. Because parsing a json file is
+/// blocking, this call is blocking.
+fn read_index_from_archive(archive_path: &Path) -> anyhow::Result<Index> {
+    std::fs::File::open(&archive_path.join("info/index.json"))
+        .map_err(anyhow::Error::new)
+        .and_then(|f| {
+            serde_json::from_reader(std::io::BufReader::new(f)).map_err(anyhow::Error::new)
+        })
+}
+
+/// Called to link an entry from the package cache into a prefix.
+async fn link_entry(
+    archive_path: &Path,
+    prefix: &Path,
+    entry: &PathEntry,
+) -> anyhow::Result<(String, PathBuf)> {
+    log::trace!("linking {}", entry.relative_path.display());
+
+    // Determine the source & destination path
+    // TODO: Determine the path based on whether this is a no_arch python package or not.
+    let source_path = archive_path.join(&entry.relative_path).canonicalize()?;
+    let destination_path = prefix.join(&entry.relative_path);
+
+    // Ensure all directories up to the path exist
+    if let Some(parent) = destination_path.parent() {
+        if !parent.exists() {
+            fs::create_dir_all(parent)
+                .await
+                .with_context(|| format!("could not create parent directory structure"))?;
+        }
+    }
+
+    // If the path already exists, remove it
+    // TODO: Properly handle clobbering here
+    if destination_path.exists() {
+        log::warn!("Clobbering: $CONDA_PREFIX/{}", destination_path.display());
+        fs::remove_file(&destination_path)
+            .await
+            .with_context(|| format!("error removing existing file"))?;
+    }
+
+    if let Some(prefix) = &entry.prefix_placeholder {
+        log::warn!(
+            "not implemented: replacing prefix in `{}`",
+            entry.relative_path.display()
+        );
+    } else {
+        // Determine how to copy the file
+        let mut link_type = if entry.path_type == PathType::HardLink && !entry.no_link {
+            LinkType::HardLink
+        } else if entry.path_type == PathType::SoftLink && !entry.no_link {
+            LinkType::SoftLink
+        } else {
+            LinkType::Copy
+        };
+
+        loop {
+            match link_type {
+                LinkType::HardLink => match fs::hard_link(&source_path, &destination_path).await {
+                    Err(_) => {
+                        log::trace!(
+                            "error hard linking `{}` --> `{}`, trying soft linking",
+                            source_path.display(),
+                            destination_path.display()
+                        );
+                        link_type = LinkType::SoftLink;
+                    }
+                    Ok(_) => {
+                        log::trace!(
+                            "hard linked `{}` --> `{}`",
+                            source_path.display(),
+                            destination_path.display()
+                        );
+                        break;
+                    }
+                },
+                LinkType::SoftLink => {
+                    match fs::symlink_file(&source_path, &destination_path).await {
+                        Err(_) => {
+                            log::trace!(
+                                "error soft linking `{}` --> `{}`, trying copying",
+                                source_path.display(),
+                                destination_path.display()
+                            );
+                            link_type = LinkType::Copy;
+                        }
+                        Ok(_) => {
+                            log::trace!(
+                                "soft linked `{}` --> `{}`",
+                                source_path.display(),
+                                destination_path.display()
+                            );
+                            break;
+                        }
+                    }
+                }
+                LinkType::Copy => match tokio::task::block_in_place(|| std::fs::copy(&source_path, &destination_path)) {
+                    Err(err) => return Err(err.into()),
+                    Ok(_) => {
+                        log::trace!(
+                            "copied `{}` --> `{}`",
+                            source_path.display(),
+                            destination_path.display()
+                        );
+                        break;
+                    }
+                },
+            }
+        }
+    }
+
+    Ok((entry.sha256.clone(), entry.relative_path.clone()))
+}
+
+enum LinkType {
+    HardLink,
+    SoftLink,
+    Copy,
 }
 
 /// Ensures that the package with the given `package_file_name` exists in the directory specified by
@@ -287,14 +431,14 @@ async fn validate_package_entry(
 ) -> Result<(), ValidationError> {
     let entry_path = archive_path.join(&entry.relative_path);
 
-    if entry.path_type == "softlink" {
-        // We don't care about softlinks for validation, they are created from other files anyway
-        return Ok(());
-    }
-
     let metadata = tokio::fs::metadata(&entry_path).await.map_err(|e| {
         ValidationError::FileMetaDataError(entry.relative_path.display().to_string(), e)
     })?;
+
+    if metadata.is_symlink() {
+        // TODO: Do something with this
+        return Ok(());
+    }
 
     // Make sure the file is a file, and not something else
     if !metadata.is_file() {
