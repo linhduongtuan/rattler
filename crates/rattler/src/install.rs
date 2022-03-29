@@ -1,7 +1,8 @@
-use crate::package_archive::{PathEntry, Paths};
+use crate::package_archive::{Index, PathEntry, Paths};
 use anyhow::Context;
 use bytes::Bytes;
-use futures::{future, Stream, TryFutureExt, TryStreamExt};
+use futures::stream::FuturesUnordered;
+use futures::{future, FutureExt, Stream, TryFutureExt, TryStreamExt};
 use itertools::Itertools;
 use once_cell::sync::Lazy;
 use reqwest_middleware::{ClientBuilder, ClientWithMiddleware};
@@ -57,19 +58,49 @@ pub async fn install_prefix<P: Package>(
     let client: LazyClient = Arc::new(Lazy::new(construct_client));
     let packages = packages.into_iter().collect_vec();
 
-    // Download all the package archives
-    let _result: Vec<_> = future::try_join_all(packages.iter().map(|package| {
-        tokio::spawn(ensure_package_archive(
-            package.filename().to_owned(),
+    // Create tasks to download all packages
+    let mut download_tasks = FuturesUnordered::new();
+    for package in packages.iter() {
+        let package_name = package.filename();
+        let package_task = tokio::spawn(install_package(
+            package_name.to_owned(),
             package.url().clone(),
             client.clone(),
             package_cache_path.clone(),
         ))
         .unwrap_or_else(|e| anyhow::Result::Err(e.into()))
-    }))
-    .await?;
+        .map(move |r| r.with_context(|| format!("error installing package `{}`", package_name)));
+        download_tasks.push(package_task);
+    }
 
-    // Determine a topological ordering of all the packages
+    // Wait for all tasks to complete
+    while let Some(download_task) = download_tasks.next().await {
+        let _ = download_task?;
+    }
+
+    Ok(())
+}
+
+pub async fn install_package(
+    package_file_name: String,
+    url: Url,
+    client: LazyClient,
+    package_cache_path: PathBuf,
+) -> anyhow::Result<()> {
+    // Ensure that the content of the package is stored on disk.
+    let archive_path =
+        ensure_package_archive(&package_file_name, &url, client, &package_cache_path).await?;
+
+    // Determine the dependencies from the archive
+    let index: Index = tokio::task::block_in_place(|| {
+        std::fs::File::open(&archive_path.join("info/index.json"))
+            .map_err(anyhow::Error::new)
+            .and_then(|f| {
+                serde_json::from_reader(std::io::BufReader::new(f)).map_err(anyhow::Error::new)
+            })
+    })
+    .with_context(|| format!("unable to read info/index.json"))?;
+    let dependencies = index.depends;
 
     Ok(())
 }
@@ -78,10 +109,10 @@ pub async fn install_prefix<P: Package>(
 /// `package_cache_path`. If the archive already exists it is validated. If it doesnt exist or is
 /// not valid, the archive is re-downloaded.
 async fn ensure_package_archive(
-    package_file_name: String,
-    url: Url,
+    package_file_name: &str,
+    url: &Url,
     client: LazyClient,
-    package_cache_path: PathBuf,
+    package_cache_path: &Path,
 ) -> anyhow::Result<PathBuf> {
     // Determine archive format and name
     let (name, format) = PackageArchiveFormat::from_file_name(&package_file_name)
@@ -241,7 +272,7 @@ async fn compute_sha256_digest(path: &Path) -> anyhow::Result<String> {
         .with_context(|| format!("unable to open {}", path.display()))?;
 
     let mut ctx = Sha256::new();
-    let mut frames = FramedRead::new(file, BytesCodec::new());
+    let mut frames = FramedRead::new(BufReader::new(file), BytesCodec::new());
     while let Some(frame) = frames.next().await {
         ctx.update(&frame.with_context(|| format!("failed to read '{}'", path.display()))?);
     }
@@ -257,21 +288,7 @@ async fn validate_package_entry(
     let entry_path = archive_path.join(&entry.relative_path);
 
     if entry.path_type == "softlink" {
-        let link_path = tokio::fs::read_link(&entry_path)
-            .await
-            .map_err(|e| ValidationError::NotALink(entry.relative_path.display().to_string(), e))?;
-
-        // FIXME: This doesnt work, what is the content of the hash??
-        // let mut ctx = Sha256::new();
-        // ctx.update(link_path.into_os_string().into_string().unwrap().as_bytes());
-        // let digest = format!("{:x}", ctx.finalize());
-        // if digest != entry.sha256 {
-        //     return Err(ValidationError::DigestMismatch(
-        //         entry.relative_path.display().to_string(),
-        //         entry.sha256.clone(),
-        //         digest,
-        //     ));
-        // }
+        // We don't care about softlinks for validation, they are created from other files anyway
         return Ok(());
     }
 
@@ -313,13 +330,14 @@ async fn validate_package_entry(
 /// Validates extracted package contents
 async fn validate_package(archive_path: &PathBuf) -> Result<(), ValidationError> {
     // Read the contents of the paths.json file
-    let paths_file = tokio::fs::File::open(&archive_path.join("info/paths.json"))
-        .await
-        .map_err(ValidationError::CouldNotOpenPathsJson)?
-        .into_std()
-        .await;
-    let paths: Paths =
-        serde_json::from_reader(paths_file).map_err(ValidationError::CouldNotDeserializePaths)?;
+    let paths: Paths = tokio::task::block_in_place(|| {
+        std::fs::File::open(&archive_path.join("info/paths.json"))
+            .map_err(ValidationError::CouldNotOpenPathsJson)
+            .and_then(|f| {
+                serde_json::from_reader(std::io::BufReader::new(f))
+                    .map_err(ValidationError::CouldNotDeserializePaths)
+            })
+    })?;
 
     // Iterate over all files and determine whether they are valid
     for entry in paths.paths.iter() {

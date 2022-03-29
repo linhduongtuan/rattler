@@ -108,18 +108,3 @@ where
     )
     .map_err(serde::de::Error::custom)
 }
-
-struct MatchSpecStr;
-
-impl<'de> DeserializeAs<'de, MatchSpec> for MatchSpecStr {
-    fn deserialize_as<D>(deserializer: D) -> Result<MatchSpec, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        MatchSpec::from_str(
-            Deserialize::deserialize(deserializer)?,
-            &ChannelConfig::default(),
-        )
-        .map_err(serde::de::Error::custom)
-    }
-}

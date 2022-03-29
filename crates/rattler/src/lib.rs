@@ -1,5 +1,6 @@
 mod channel;
 mod environment_spec;
+mod gate;
 pub mod install;
 mod match_spec;
 mod match_spec_constraints;
@@ -11,6 +12,8 @@ mod solver;
 pub(crate) mod utils;
 mod version;
 mod version_spec;
+
+pub use gate::Gate;
 
 pub use channel::{
     Channel, ChannelConfig, FetchRepoDataError, FetchRepoDataProgress, ParseChannelError,
