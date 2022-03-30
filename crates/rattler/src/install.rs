@@ -2,7 +2,7 @@ use crate::package_archive::{FileMode, Index, PathEntry, PathType, Paths};
 use anyhow::Context;
 use bytes::Bytes;
 use futures::stream::FuturesUnordered;
-use futures::{future, FutureExt, Stream, TryFutureExt, TryStreamExt};
+use futures::{FutureExt, TryFutureExt, TryStreamExt};
 use itertools::Itertools;
 use once_cell::sync::Lazy;
 use reqwest_middleware::{ClientBuilder, ClientWithMiddleware};
@@ -95,20 +95,33 @@ pub async fn install_package(
     let archive_path =
         ensure_package_archive(&package_file_name, &url, client, &package_cache_path).await?;
 
-    // Read the contents of the index.json file
-    let index: Index = tokio::task::block_in_place(|| read_index_from_archive(&archive_path))?;
-
-    // Read the contents of the paths.json file
-    let paths: Paths = tokio::task::block_in_place(|| read_paths_from_archive(&archive_path))?;
+    // Read the contents of the index.json and paths.json files
+    let index_future = {
+        let index_archive_path = archive_path.clone();
+        tokio::task::spawn_blocking(move || read_index_from_archive(&index_archive_path))
+            .unwrap_or_else(|e| Err(e.into()))
+    };
+    let paths_future = {
+        let index_archive_path = archive_path.clone();
+        tokio::task::spawn_blocking(move || read_paths_from_archive(&index_archive_path))
+            .unwrap_or_else(|e| Err(e.into()))
+    };
+    let (index, paths) = tokio::try_join!(index_future, paths_future)?;
 
     // Install all files
     let mut link_tasks = FuturesUnordered::new();
     for entry in paths.paths.iter() {
-        let relative_path = entry.relative_path.clone();
-        let link_future = link_entry(&archive_path, &prefix, entry).map(|r| {
-            r.with_context(move || format!("error linking `{}`", relative_path.display()))
-        });
-        link_tasks.push(link_future);
+        let link_task = {
+            let archive_path = archive_path.clone();
+            let prefix = prefix.clone();
+            let entry = entry.clone();
+            tokio_rayon::spawn(move || {
+                link_entry(&archive_path, &prefix, &entry).with_context(move || {
+                    format!("error linking `{}`", entry.relative_path.display())
+                })
+            })
+        };
+        link_tasks.push(link_task);
     }
 
     // Wait for all tasks to complete
@@ -140,7 +153,7 @@ fn read_index_from_archive(archive_path: &Path) -> anyhow::Result<Index> {
 }
 
 /// Called to link an entry from the package cache into a prefix.
-async fn link_entry(
+fn link_entry(
     archive_path: &Path,
     prefix: &Path,
     entry: &PathEntry,
@@ -149,14 +162,13 @@ async fn link_entry(
 
     // Determine the source & destination path
     // TODO: Determine the path based on whether this is a no_arch python package or not.
-    let source_path = archive_path.join(&entry.relative_path).canonicalize()?;
+    let source_path = archive_path.join(&entry.relative_path);
     let destination_path = prefix.join(&entry.relative_path);
 
     // Ensure all directories up to the path exist
     if let Some(parent) = destination_path.parent() {
         if !parent.exists() {
-            fs::create_dir_all(parent)
-                .await
+            std::fs::create_dir_all(parent)
                 .with_context(|| format!("could not create parent directory structure"))?;
         }
     }
@@ -164,9 +176,11 @@ async fn link_entry(
     // If the path already exists, remove it
     // TODO: Properly handle clobbering here
     if destination_path.exists() {
-        log::warn!("Clobbering: $CONDA_PREFIX/{}", destination_path.display());
-        fs::remove_file(&destination_path)
-            .await
+        log::warn!(
+            "Clobbering: $CONDA_PREFIX/{}",
+            entry.relative_path.display()
+        );
+        std::fs::remove_file(&destination_path)
             .with_context(|| format!("error removing existing file"))?;
     }
 
@@ -187,7 +201,7 @@ async fn link_entry(
 
         loop {
             match link_type {
-                LinkType::HardLink => match fs::hard_link(&source_path, &destination_path).await {
+                LinkType::HardLink => match std::fs::hard_link(&source_path, &destination_path) {
                     Err(_) => {
                         log::trace!(
                             "error hard linking `{}` --> `{}`, trying soft linking",
@@ -205,19 +219,30 @@ async fn link_entry(
                         break;
                     }
                 },
-                LinkType::SoftLink => {
-                    match fs::symlink_file(&source_path, &destination_path).await {
-                        Err(_) => {
-                            log::trace!(
-                                "error soft linking `{}` --> `{}`, trying copying",
-                                source_path.display(),
-                                destination_path.display()
-                            );
-                            link_type = LinkType::Copy;
-                        }
+                LinkType::SoftLink => match std::fs::soft_link(&source_path, &destination_path) {
+                    Err(_) => {
+                        log::trace!(
+                            "error soft linking `{}` --> `{}`, trying copying",
+                            source_path.display(),
+                            destination_path.display()
+                        );
+                        link_type = LinkType::Copy;
+                    }
+                    Ok(_) => {
+                        log::trace!(
+                            "soft linked `{}` --> `{}`",
+                            source_path.display(),
+                            destination_path.display()
+                        );
+                        break;
+                    }
+                },
+                LinkType::Copy => {
+                    match std::fs::copy(&source_path, &destination_path) {
+                        Err(err) => return Err(err.into()),
                         Ok(_) => {
                             log::trace!(
-                                "soft linked `{}` --> `{}`",
+                                "copied `{}` --> `{}`",
                                 source_path.display(),
                                 destination_path.display()
                             );
@@ -225,17 +250,6 @@ async fn link_entry(
                         }
                     }
                 }
-                LinkType::Copy => match tokio::task::block_in_place(|| std::fs::copy(&source_path, &destination_path)) {
-                    Err(err) => return Err(err.into()),
-                    Ok(_) => {
-                        log::trace!(
-                            "copied `{}` --> `{}`",
-                            source_path.display(),
-                            destination_path.display()
-                        );
-                        break;
-                    }
-                },
             }
         }
     }
@@ -474,14 +488,19 @@ async fn validate_package_entry(
 /// Validates extracted package contents
 async fn validate_package(archive_path: &PathBuf) -> Result<(), ValidationError> {
     // Read the contents of the paths.json file
-    let paths: Paths = tokio::task::block_in_place(|| {
-        std::fs::File::open(&archive_path.join("info/paths.json"))
-            .map_err(ValidationError::CouldNotOpenPathsJson)
-            .and_then(|f| {
-                serde_json::from_reader(std::io::BufReader::new(f))
-                    .map_err(ValidationError::CouldNotDeserializePaths)
-            })
-    })?;
+    let paths: Paths = {
+        let archive_path = archive_path.clone();
+        tokio::task::spawn_blocking(move || {
+            std::fs::File::open(&archive_path.join("info/paths.json"))
+                .map_err(ValidationError::CouldNotOpenPathsJson)
+                .and_then(|f| {
+                    serde_json::from_reader(std::io::BufReader::new(f))
+                        .map_err(ValidationError::CouldNotDeserializePaths)
+                })
+        })
+        .unwrap_or_else(|e| Err(ValidationError::Unknown(e.into())))
+    }
+    .await?;
 
     // Iterate over all files and determine whether they are valid
     for entry in paths.paths.iter() {
