@@ -43,6 +43,8 @@ pretty_env_logger = "0.4.0"
 async-once-cell = "0.3.0"
 sha2 = "0.10.2"
 async_zip = "0.0.6"
+memmap2 = "0.5.3"
+twoway = "0.2.2"
 
 [dev-dependencies]
 rand = "0.8.4"
