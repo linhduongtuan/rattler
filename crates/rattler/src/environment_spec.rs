@@ -115,13 +115,11 @@ impl TryFrom<Url> for ExplicitPackageSpec {
             };
 
         // Extract information of the package from the filename
-        let mut package_split_iter = package_archive_name.rsplit('-');
-        let (name, version, build) = match (
-            package_split_iter.next(),
-            package_split_iter.next(),
-            package_split_iter.next(),
-        ) {
-            (Some(build), Some(version), Some(name)) => (name, version, build),
+        let (name, version, build) = match package_archive_name
+            .rsplit_once('-')
+            .map(|(rest, build)| (rest.rsplit_once('-'), build))
+        {
+            Some((Some((name, version)), build)) => (name, version, build),
             _ => {
                 return Err(ParseExplicitSpecError::InvalidPackageArchiveName(
                     package_archive_name.to_owned(),

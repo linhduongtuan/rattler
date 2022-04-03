@@ -1,4 +1,8 @@
+mod python;
+
+use crate::install::python::PythonInfo;
 use crate::package_archive::{FileMode, Index, NoArchType, PathEntry, PathType, Paths};
+use crate::Version;
 use anyhow::Context;
 use futures::stream::FuturesUnordered;
 use futures::{FutureExt, TryFutureExt, TryStreamExt};
@@ -8,13 +12,15 @@ use reqwest_middleware::{ClientBuilder, ClientWithMiddleware};
 use reqwest_retry::policies::ExponentialBackoff;
 use reqwest_retry::RetryTransientMiddleware;
 use sha2::{Digest, Sha256};
+use std::borrow::Borrow;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use thiserror::Error;
 use tokio::fs;
 use tokio::io;
 use tokio::io::{AsyncBufRead, BufReader};
+use tokio::sync::watch;
 use tokio_stream::StreamExt;
 use tokio_tar::Archive;
 use tokio_util::codec::{BytesCodec, FramedRead};
@@ -40,6 +46,49 @@ fn construct_client() -> ClientWithMiddleware {
 
 type LazyClient = Arc<Lazy<ClientWithMiddleware>>;
 
+#[derive(Clone, Debug)]
+struct PythonLinkStatus {
+    has_python: bool,
+    sender: Arc<Mutex<watch::Sender<Option<Arc<PythonInfo>>>>>,
+    receiver: watch::Receiver<Option<Arc<PythonInfo>>>,
+}
+
+#[derive(Clone, Debug, Error)]
+enum PythonLinkStatusError {
+    #[error("no package provides python")]
+    NoPackageProvidesPython,
+}
+
+impl PythonLinkStatus {
+    fn new(has_python: bool) -> Self {
+        let (sender, receiver) = watch::channel(None);
+        Self {
+            has_python,
+            sender: Arc::new(Mutex::new(sender)),
+            receiver,
+        }
+    }
+
+    async fn wait_for_info(&self) -> Result<Arc<PythonInfo>, PythonLinkStatusError> {
+        if !self.has_python {
+            return Err(PythonLinkStatusError::NoPackageProvidesPython);
+        }
+
+        let mut local = self.receiver.clone();
+        loop {
+            if let Some(value) = local.borrow().as_ref() {
+                return Ok(value.clone());
+            }
+            local.changed().await.unwrap()
+        }
+    }
+
+    fn set(&self, info: PythonInfo) {
+        let lock = self.sender.lock().expect("lock is poisoned");
+        let _ = lock.send(Some(Arc::new(info)));
+    }
+}
+
 /// Installs the specified packages to the specified destination.
 pub async fn install_prefix(
     packages: impl IntoIterator<Item = InstallSpec>,
@@ -53,6 +102,11 @@ pub async fn install_prefix(
     let client: LazyClient = Arc::new(Lazy::new(construct_client));
     let packages = packages.into_iter().collect_vec();
 
+    // Determine if a python package is installed. This is required to be able to do no arch python
+    // package compilation.
+    let has_python_package = packages.iter().find(|p| p.name == "python").is_some();
+    let python_link_status = PythonLinkStatus::new(has_python_package);
+
     // Create tasks to download all packages
     let mut download_tasks = FuturesUnordered::new();
     for package in packages.iter() {
@@ -64,6 +118,7 @@ pub async fn install_prefix(
             package.url.clone(),
             client.clone(),
             package_cache_path.clone(),
+            python_link_status.clone(),
         ))
         .unwrap_or_else(|e| anyhow::Result::Err(e.into()))
         .map(move |r| r.with_context(|| format!("error installing package `{}`", package_name)));
@@ -78,12 +133,13 @@ pub async fn install_prefix(
     Ok(())
 }
 
-pub async fn install_package(
+async fn install_package(
     prefix: PathBuf,
     package_name: String,
     url: Url,
     client: LazyClient,
     package_cache_path: PathBuf,
+    python_link_state: PythonLinkStatus,
 ) -> anyhow::Result<()> {
     // Ensure that the content of the package is stored on disk.
     let archive_path = fetch_package_archive(&url, client, &package_cache_path).await?;
@@ -100,6 +156,11 @@ pub async fn install_package(
             .unwrap_or_else(|e| Err(e.into()))
     };
     let (index, paths) = tokio::try_join!(index_future, paths_future)?;
+
+    // Wait for python to complete before linking noarch packages
+    if matches!(index.noarch, Some(NoArchType::Python)) {
+        python_link_state.wait_for_info().await?;
+    }
 
     // Install all files
     let mut link_tasks = FuturesUnordered::new();
@@ -121,6 +182,12 @@ pub async fn install_package(
     // Wait for all tasks to complete
     while let Some(link_task) = link_tasks.next().await {
         let _ = link_task?;
+    }
+
+    // If we just installed python, update the python information channel so other packages that
+    // require python in their linking process can continue.
+    if package_name == "python" {
+        python_link_state.set(PythonInfo::from_version(&index.version)?);
     }
 
     log::info!("finished linking {}", &package_name);
@@ -147,8 +214,6 @@ fn read_index_from_archive(archive_path: &Path) -> anyhow::Result<Index> {
             serde_json::from_reader(std::io::BufReader::new(f)).map_err(anyhow::Error::new)
         })
 }
-
-// fn get_python_noarch_target_path(relative_path: &Path, )
 
 /// Called to link an entry from the package cache into a prefix.
 fn link_entry(

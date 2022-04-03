@@ -25,6 +25,12 @@ pub struct Version {
 }
 
 impl Version {
+    /// Tries to extract the major and minor versions from the version. Returns None if this instance
+    /// doesnt appear to contain a major and minor version.
+    pub fn as_major_minor(&self) -> Option<(usize, usize)> {
+        self.version.as_major_minor()
+    }
+
     /// Bumps this version to a version that is considered just higher than this version.
     pub fn bump(&self) -> Self {
         let mut result = self.clone();
@@ -69,10 +75,30 @@ impl Eq for Version {}
 
 /// Either a number, literal or the infinity.
 #[derive(Debug, Clone, Eq, PartialEq, Hash, derive_more::From, Serialize, Deserialize)]
-enum NumeralOrOther {
+pub enum NumeralOrOther {
     Numeral(usize),
     Other(String),
     Infinity,
+}
+
+impl NumeralOrOther {
+    pub fn as_number(&self) -> Option<usize> {
+        match self {
+            NumeralOrOther::Numeral(value) => Some(*value),
+            _ => None,
+        }
+    }
+
+    pub fn as_string(&self) -> Option<&str> {
+        match self {
+            NumeralOrOther::Other(value) => Some(value.as_str()),
+            _ => None,
+        }
+    }
+
+    pub fn is_infinity(&self) -> bool {
+        matches!(self, NumeralOrOther::Infinity)
+    }
 }
 
 impl Default for NumeralOrOther {
@@ -118,6 +144,40 @@ struct VersionComponent {
 }
 
 impl VersionComponent {
+    /// Tries to extract the major and minor versions from the version. Returns None if this instance
+    /// doesnt appear to contain a major and minor version.
+    pub fn as_major_minor(&self) -> Option<(usize, usize)> {
+        match (self.range_as_number(1), self.range_as_number(2)) {
+            (Some(major), Some(minor)) => Some((major, minor)),
+            _ => None,
+        }
+    }
+
+    /// Tries to convert the specified range to a number. Returns the number if possible; None otherwise.
+    fn range_as_number(&self, range_idx: usize) -> Option<usize> {
+        let range = self.ranges.get(range_idx)?;
+        if range.end != range.start + 1 {
+            return None;
+        }
+        let component = self.components.get(range.start)?;
+        component.as_number()
+    }
+
+    pub fn version_part(&self) -> impl Iterator<Item = &'_ NumeralOrOther> + '_ {
+        self.ranges
+            .get(1)
+            .cloned()
+            .map(move |component| {
+                (component.start..component.end).map(move |idx| &self.components[idx])
+            })
+            .into_iter()
+            .flatten()
+    }
+
+    pub fn epoch(&self) -> Option<usize> {
+        self.range_as_number(0)
+    }
+
     pub fn starts_with(&self, other: &Self) -> bool {
         for ranges in self.ranges.iter().zip_longest(other.ranges.iter()) {
             let (left, right) = match ranges {
