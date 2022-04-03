@@ -1,4 +1,4 @@
-use crate::package_archive::{FileMode, Index, PathEntry, PathType, Paths};
+use crate::package_archive::{FileMode, Index, NoArchType, PathEntry, PathType, Paths};
 use anyhow::Context;
 use futures::stream::FuturesUnordered;
 use futures::{FutureExt, TryFutureExt, TryStreamExt};
@@ -21,19 +21,13 @@ use tokio_util::codec::{BytesCodec, FramedRead};
 use tokio_util::io::StreamReader;
 use url::Url;
 
-pub trait Package {
-    /// Returns the unique identifier of this package
-    fn filename(&self) -> &str;
+#[derive(Debug, Clone)]
+pub struct InstallSpec {
+    /// The name of the package
+    pub name: String,
 
-    /// The URL to download the package content from
-    fn url(&self) -> &Url;
-
-    /// Returns the filenames of the packages that this package depends on or None if this cannot
-    /// be determined. If this can not be determine the contents of the package is examined to
-    /// find the dependencies.
-    fn dependencies(&self) -> Option<&[&str]> {
-        None
-    }
+    /// The location where we can find the package archive.
+    pub url: Url,
 }
 
 /// Constructs a `reqwest` client.
@@ -47,8 +41,8 @@ fn construct_client() -> ClientWithMiddleware {
 type LazyClient = Arc<Lazy<ClientWithMiddleware>>;
 
 /// Installs the specified packages to the specified destination.
-pub async fn install_prefix<P: Package>(
-    packages: impl IntoIterator<Item = P>,
+pub async fn install_prefix(
+    packages: impl IntoIterator<Item = InstallSpec>,
     prefix: impl AsRef<Path>,
     package_cache_path: impl AsRef<Path>,
 ) -> anyhow::Result<()> {
@@ -63,11 +57,11 @@ pub async fn install_prefix<P: Package>(
     let mut download_tasks = FuturesUnordered::new();
     for package in packages.iter() {
         let prefix = prefix.clone();
-        let package_name = package.filename();
+        let package_name = package.name.clone();
         let package_task = tokio::spawn(install_package(
             prefix,
             package_name.to_owned(),
-            package.url().clone(),
+            package.url.clone(),
             client.clone(),
             package_cache_path.clone(),
         ))
@@ -86,14 +80,13 @@ pub async fn install_prefix<P: Package>(
 
 pub async fn install_package(
     prefix: PathBuf,
-    package_file_name: String,
+    package_name: String,
     url: Url,
     client: LazyClient,
     package_cache_path: PathBuf,
 ) -> anyhow::Result<()> {
     // Ensure that the content of the package is stored on disk.
-    let archive_path =
-        ensure_package_archive(&package_file_name, &url, client, &package_cache_path).await?;
+    let archive_path = fetch_package_archive(&url, client, &package_cache_path).await?;
 
     // Read the contents of the index.json and paths.json files
     let index_future = {
@@ -115,8 +108,9 @@ pub async fn install_package(
             let archive_path = archive_path.clone();
             let prefix = prefix.clone();
             let entry = entry.clone();
+            let no_arch_type = index.noarch;
             tokio_rayon::spawn(move || {
-                link_entry(&archive_path, &prefix, &entry).with_context(move || {
+                link_entry(&archive_path, &prefix, &entry, no_arch_type).with_context(move || {
                     format!("error linking `{}`", entry.relative_path.display())
                 })
             })
@@ -129,7 +123,7 @@ pub async fn install_package(
         let _ = link_task?;
     }
 
-    log::info!("finished linking {}", &package_file_name);
+    log::info!("finished linking {}", &package_name);
 
     Ok(())
 }
@@ -154,17 +148,24 @@ fn read_index_from_archive(archive_path: &Path) -> anyhow::Result<Index> {
         })
 }
 
+// fn get_python_noarch_target_path(relative_path: &Path, )
+
 /// Called to link an entry from the package cache into a prefix.
 fn link_entry(
     archive_path: &Path,
     prefix: &Path,
     entry: &PathEntry,
+    no_arch_type: Option<NoArchType>,
 ) -> anyhow::Result<(String, PathBuf)> {
     log::trace!("linking {}", entry.relative_path.display());
 
     // Determine the source & destination path
     // TODO: Determine the path based on whether this is a no_arch python package or not.
     let source_path = archive_path.join(&entry.relative_path);
+    // let destination_path = if matches!(no_arch_type, Some(NoArchType::Python)) {
+    // } else {
+    //     prefix.join(&entry.relative_path)
+    // };
     let destination_path = prefix.join(&entry.relative_path);
 
     // Ensure all directories up to the path exist
@@ -350,8 +351,14 @@ fn copy_replace_prefix_text(
 /// copying if hard-linking fails.
 fn hard_link_entry(source_path: &Path, destination_path: &Path) -> anyhow::Result<()> {
     std::fs::hard_link(source_path, destination_path)
-        .or_else(|_| std::fs::soft_link(source_path, destination_path))
-        .or_else(|_| std::fs::copy(source_path, destination_path).map(|_| ()))
+        .or_else(|e| {
+            log::debug!("unable to hardlink `{}`: {}", destination_path.display(), e);
+            std::fs::soft_link(source_path, destination_path)
+        })
+        .or_else(|e| {
+            log::debug!("unable to softlink `{}`: {}", destination_path.display(), e);
+            std::fs::copy(source_path, destination_path).map(|_| ())
+        })
         .context("error hard linking entry")
 }
 
@@ -359,7 +366,10 @@ fn hard_link_entry(source_path: &Path, destination_path: &Path) -> anyhow::Resul
 /// soft-linking fails.
 fn soft_link_entry(source_path: &Path, destination_path: &Path) -> anyhow::Result<()> {
     std::fs::soft_link(source_path, destination_path)
-        .or_else(|_| std::fs::copy(source_path, destination_path).map(|_| ()))
+        .or_else(|e| {
+            log::debug!("unable to softlink `{}`: {}", destination_path.display(), e);
+            std::fs::copy(source_path, destination_path).map(|_| ())
+        })
         .context("error soft linking entry")
 }
 
@@ -379,12 +389,18 @@ enum LinkType {
 /// Ensures that the package with the given `package_file_name` exists in the directory specified by
 /// `package_cache_path`. If the archive already exists it is validated. If it doesnt exist or is
 /// not valid, the archive is re-downloaded.
-async fn ensure_package_archive(
-    package_file_name: &str,
+async fn fetch_package_archive(
     url: &Url,
     client: LazyClient,
     package_cache_path: &Path,
 ) -> anyhow::Result<PathBuf> {
+    let package_file_name = url
+        .path_segments()
+        .and_then(|segments| segments.last())
+        .ok_or_else(|| {
+            anyhow::anyhow!("could not determine package archive filename from url `{url}`")
+        })?;
+
     // Determine archive format and name
     let (name, format) = PackageArchiveFormat::from_file_name(&package_file_name)
         .ok_or_else(|| anyhow::anyhow!("unsupported package archive format"))?;

@@ -22,7 +22,7 @@ pub use install::install_prefix;
 pub use match_spec::MatchSpec;
 pub use match_spec_constraints::MatchSpecConstraints;
 pub use platform::{ParsePlatformError, Platform};
-pub use repo_data::{ChannelInfo, NoArchType, PackageRecord, RepoData};
+pub use repo_data::{ChannelInfo, PackageRecord, RepoData};
 pub use solver::{PackageIndex, SolverIndex};
 pub use version::{ParseVersionError, ParseVersionErrorKind, Version};
 pub use version_spec::VersionSpec;

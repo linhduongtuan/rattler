@@ -4,13 +4,6 @@ use serde::{Deserialize, Deserializer};
 use serde_with::{serde_as, DeserializeAs};
 use std::fmt::{Display, Formatter};
 
-#[derive(Debug, Deserialize, Clone, Copy)]
-#[serde(rename_all = "lowercase")]
-pub enum NoArchType {
-    Generic,
-    Python,
-}
-
 /// [`RepoData`] is an index of package binaries available on in a subdirectory of a Conda channel.
 #[derive(Debug, Deserialize)]
 pub struct RepoData {

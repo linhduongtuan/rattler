@@ -1,5 +1,8 @@
+use crate::version_spec::VersionOperator;
+use crate::{Channel, ParseVersionError, Version};
 use futures::{future, StreamExt, TryStreamExt};
 use std::collections::HashSet;
+use std::convert::TryFrom;
 use std::path::Path;
 use std::str::FromStr;
 use thiserror::Error;
@@ -61,46 +64,80 @@ impl ExplicitEnvironment {
 pub enum ParseExplicitSpecError {
     #[error("cannot parse url: {0}")]
     UrlParseError(#[from] url::ParseError),
+
+    #[error("url does not refer to a package archive")]
+    NotAPackageArchive,
+
+    #[error("invalid package archive name: '{0}'")]
+    InvalidPackageArchiveName(String),
+
+    #[error("invalid version")]
+    InvalidVersion(#[from] ParseVersionError),
 }
 
 #[derive(Clone, Eq, PartialEq, Hash, Debug)]
 pub struct ExplicitPackageSpec {
-    url: Url,
+    pub url: Url,
+    pub name: String,
+    pub version: Version,
+    pub channel: Channel,
+    pub build_string: String,
 }
 
 impl FromStr for ExplicitPackageSpec {
     type Err = ParseExplicitSpecError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Ok(ExplicitPackageSpec {
-            url: Url::parse(s)?,
+        ExplicitPackageSpec::try_from(Url::parse(s)?)
+    }
+}
+
+impl TryFrom<Url> for ExplicitPackageSpec {
+    type Error = ParseExplicitSpecError;
+
+    fn try_from(url: Url) -> Result<Self, Self::Error> {
+        // Parse a channel part from the URL
+        let channel = Channel::from_url(&url, None);
+
+        // Get the package archive name from the URL
+        // TODO: Maybe extract this into a function?
+        let package_archive_name =
+            if let Some(last_segment) = url.path_segments().and_then(|s| s.last()) {
+                if let Some(name) = last_segment.strip_suffix(".tar.bz2") {
+                    name
+                } else if let Some(name) = last_segment.strip_suffix(".conda") {
+                    name
+                } else {
+                    return Err(ParseExplicitSpecError::NotAPackageArchive);
+                }
+            } else {
+                return Err(ParseExplicitSpecError::NotAPackageArchive);
+            };
+
+        // Extract information of the package from the filename
+        let mut package_split_iter = package_archive_name.rsplit('-');
+        let (name, version, build) = match (
+            package_split_iter.next(),
+            package_split_iter.next(),
+            package_split_iter.next(),
+        ) {
+            (Some(build), Some(version), Some(name)) => (name, version, build),
+            _ => {
+                return Err(ParseExplicitSpecError::InvalidPackageArchiveName(
+                    package_archive_name.to_owned(),
+                ))
+            }
+        };
+
+        // Parse the version
+        let version = Version::from_str(version)?;
+
+        Ok(Self {
+            name: name.to_owned(),
+            build_string: build.to_owned(),
+            version,
+            channel,
+            url,
         })
-    }
-}
-
-impl ExplicitPackageSpec {
-    /// Returns the Url of this instance
-    pub fn url(&self) -> &Url {
-        &self.url
-    }
-
-    /// Returns the expected MD5 hash if specified
-    pub fn md5(&self) -> Option<&str> {
-        self.url.fragment()
-    }
-}
-
-impl crate::install::Package for ExplicitPackageSpec {
-    fn filename(&self) -> &str {
-        self.url
-            .path_segments()
-            .into_iter()
-            .flatten()
-            .last()
-            .expect("invalid url without path")
-    }
-
-    fn url(&self) -> &Url {
-        &self.url
     }
 }

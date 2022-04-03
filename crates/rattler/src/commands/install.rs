@@ -1,3 +1,4 @@
+use rattler::install::InstallSpec;
 use rattler::{install_prefix, EnvironmentSpec};
 use std::env::current_dir;
 use std::path::PathBuf;
@@ -24,7 +25,13 @@ pub async fn install(opt: Opt) -> anyhow::Result<()> {
     log::debug!("packages cache dir: {}", cache_dir.display());
 
     install_prefix(
-        explicit_environment.specs.into_iter(),
+        explicit_environment
+            .specs
+            .into_iter()
+            .map(|spec| InstallSpec {
+                name: spec.name,
+                url: spec.url,
+            }),
         &prefix_dir,
         cache_dir,
     )

@@ -2,17 +2,26 @@ use crate::{
     utils::{version_from_str, MatchSpecStr},
     MatchSpec, Version,
 };
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_with::serde_as;
-use sha2::digest::Output;
-use sha2::Sha256;
 use std::collections::HashSet;
 use std::path::PathBuf;
+
+#[derive(Debug, Copy, Clone)]
+pub enum NoArchType {
+    GenericV1,
+    GenericV2,
+    Python,
+}
 
 #[serde_as]
 #[derive(Clone, Debug, Deserialize)]
 pub struct Index {
     pub arch: Option<String>,
+
+    #[serde(deserialize_with = "deserialize_no_arch", default)]
+    pub noarch: Option<NoArchType>,
+
     pub build: String,
     pub build_number: usize,
     pub license: Option<String>,
@@ -55,15 +64,15 @@ pub struct PathEntry {
     pub no_link: bool,
 }
 
-#[serde(rename_all = "lowercase")]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Hash)]
+#[serde(rename_all = "lowercase")]
 pub enum FileMode {
     Binary,
     Text,
 }
 
-#[serde(rename_all = "lowercase")]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Hash)]
+#[serde(rename_all = "lowercase")]
 pub enum PathType {
     HardLink,
     SoftLink,
@@ -90,4 +99,32 @@ fn no_link_default() -> bool {
 /// Returns true if the value is equal to the default value for the "no_link" value of a [`PathEntry`]
 fn is_no_link_default(value: &bool) -> bool {
     *value == no_link_default()
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(untagged)]
+enum NoArchSerde {
+    OldFormat(bool),
+    NewFormat(NoArchTypeSerde),
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum NoArchTypeSerde {
+    Python,
+    Generic,
+}
+
+// Helper function to parse the `noarch` field in conda package index.json.
+fn deserialize_no_arch<'de, D>(deserializer: D) -> Result<Option<NoArchType>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<NoArchSerde>::deserialize(deserializer)?;
+    Ok(value.and_then(|value| match value {
+        NoArchSerde::OldFormat(true) => Some(NoArchType::GenericV1),
+        NoArchSerde::OldFormat(false) => None,
+        NoArchSerde::NewFormat(NoArchTypeSerde::Python) => Some(NoArchType::Python),
+        NoArchSerde::NewFormat(NoArchTypeSerde::Generic) => Some(NoArchType::GenericV2),
+    }))
 }

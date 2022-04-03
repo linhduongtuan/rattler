@@ -1,8 +1,9 @@
 mod fetch;
 
 use super::{ParsePlatformError, Platform};
+use itertools::Itertools;
 use serde::{Deserialize, Serialize};
-use smallvec::SmallVec;
+use smallvec::{smallvec, SmallVec};
 use std::path::PathBuf;
 use std::str::FromStr;
 use thiserror::Error;
@@ -29,7 +30,7 @@ impl Default for ChannelConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Eq, PartialEq)]
+#[derive(Debug, Clone, Serialize, Eq, PartialEq, Hash)]
 pub struct Channel {
     /// The platforms supported by this channel, or None if no explicit platforms have been
     /// specified.
@@ -57,12 +58,12 @@ impl Channel {
 
         let channel = if parse_scheme(channel).is_some() {
             let url = Url::parse(channel)?;
-            Channel::from_url(url, platforms, config)
+            Channel::from_url(&url, platforms)
         } else if is_path(channel) {
             let path = PathBuf::from(channel);
             let url =
                 Url::from_file_path(&path).map_err(|_| ParseChannelError::InvalidPath(path))?;
-            Channel::from_url(url, platforms, config)
+            Channel::from_url(&url, platforms)
         } else {
             Channel::from_name(channel, platforms, config)
         };
@@ -71,21 +72,42 @@ impl Channel {
     }
 
     /// Constructs a new [`Channel`] from a `Url` and associated platforms.
-    pub fn from_url(
-        url: Url,
-        platforms: Option<impl Into<SmallVec<[Platform; 2]>>>,
-        _config: &ChannelConfig,
-    ) -> Self {
-        let path = url.path().trim_end_matches('/');
+    pub fn from_url(url: &Url, mut platforms: Option<SmallVec<[Platform; 2]>>) -> Self {
+        let SplitCondaUrl {
+            mut path,
+            host,
+            port,
+            ..
+        } = SplitCondaUrl::from(url);
 
         // Case 1: No path give, channel name is ""
         if path.is_empty() {
             return Self {
-                platforms: platforms.map(Into::into),
+                platforms,
                 scheme: url.scheme().to_owned(),
                 location: url.host_str().unwrap_or("").to_owned(),
                 name: String::from(""),
             };
+        }
+
+        if let Some(last_path) = path.last() {
+            match Platform::from_str(*last_path) {
+                Ok(platform) => {
+                    // Ends in a platform string, add it to the platforms
+                    platforms = Some(
+                        platforms
+                            .map(|mut platforms| {
+                                platforms.push(platform);
+                                platforms
+                            })
+                            .unwrap_or_else(|| smallvec![platform]),
+                    );
+                    path.pop();
+                }
+                Err(_) => {
+                    // Not a platform string, ignore
+                }
+            }
         }
 
         // Case 2: migrated_custom_channels
@@ -93,27 +115,33 @@ impl Channel {
         // Case 4: custom_channels matches
         // Case 5: channel_alias match
 
-        if let Some(host) = url.host_str() {
+        if let Some(host) = host {
             // Case 7: Fallback
-            let location = if let Some(port) = url.port() {
+            let location = if let Some(port) = port {
                 format!("{}:{}", host, port)
             } else {
                 host.to_owned()
             };
             Self {
-                platforms: platforms.map(Into::into),
+                platforms,
                 scheme: url.scheme().to_owned(),
                 location,
-                name: path.trim_start_matches('/').to_owned(),
+                name: path.join("/"),
             }
         } else {
             // Case 6: non-otherwise-specified file://-type urls
-            let (location, name) = url
-                .path()
-                .rsplit_once('/')
-                .unwrap_or_else(|| ("/", url.path()));
+            let mut path_iter = path.into_iter().peekable();
+            let (location, name) = if let Some(location) = path_iter.next() {
+                if path_iter.peek().is_some() {
+                    (location, path_iter.join("/"))
+                } else {
+                    ("/", location.to_owned())
+                }
+            } else {
+                unreachable!("should be unreachable because we check if the path is not empty")
+            };
             Self {
-                platforms: platforms.map(Into::into),
+                platforms,
                 scheme: String::from("file"),
                 location: location.to_owned(),
                 name: name.to_owned(),
@@ -178,6 +206,55 @@ impl Channel {
     /// Returns the canonical name of the channel
     pub fn canonical_name(&self) -> String {
         format!("{}://{}/{}", self.scheme, self.location, self.name)
+    }
+}
+
+struct SplitCondaUrl<'a> {
+    scheme: &'a str,
+    host: Option<&'a str>,
+    port: Option<u16>,
+    token: Option<&'a str>,
+    path: Vec<&'a str>,
+    filename: Option<&'a str>,
+}
+
+impl<'a> From<&'a Url> for SplitCondaUrl<'a> {
+    fn from(url: &'a Url) -> Self {
+        let mut path_segments = url
+            .path_segments()
+            .map(|segments| segments.collect_vec())
+            .unwrap_or_default();
+
+        // Remove the token segments
+        let mut token = None;
+        let mut segment_iter = path_segments.iter().enumerate().peekable();
+        while let Some((idx, segment)) = segment_iter.next() {
+            if *segment == "t" {
+                if let Some((_, t)) = segment_iter.peek() {
+                    token = Some(**t);
+                    path_segments.remove(idx);
+                    path_segments.remove(idx);
+                    break;
+                }
+            }
+        }
+
+        // If the path has a package archive extension, remove it from the path
+        let mut filename = None;
+        if let Some(last) = path_segments.last() {
+            if last.ends_with(".conda") || last.ends_with(".tar.bz2") {
+                filename = path_segments.pop();
+            }
+        }
+
+        Self {
+            scheme: url.scheme(),
+            host: url.host_str(),
+            port: url.port(),
+            token,
+            path: path_segments,
+            filename,
+        }
     }
 }
 
