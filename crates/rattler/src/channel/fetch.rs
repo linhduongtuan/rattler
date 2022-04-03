@@ -106,7 +106,7 @@ impl Channel {
 
         // Decode the JSON into actual repo data
         callback(FetchRepoDataProgress::Decoding);
-        let repo_data = serde_json::from_slice(&bytes)?;
+        let repo_data = tokio::task::block_in_place(|| serde_json::from_slice(&bytes))?;
 
         Ok(repo_data)
     }

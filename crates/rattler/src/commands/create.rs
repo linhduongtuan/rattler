@@ -1,3 +1,4 @@
+use futures::TryFutureExt;
 use http_cache_reqwest::{CACacheManager, Cache, CacheMode, HttpCache};
 use indicatif::{ProgressBar, ProgressStyle};
 use itertools::Itertools;
@@ -11,9 +12,11 @@ use rattler::{
 use reqwest_middleware::ClientBuilder;
 use reqwest_retry::policies::ExponentialBackoff;
 use reqwest_retry::RetryTransientMiddleware;
+use std::panic;
 use std::str::FromStr;
 use structopt::StructOpt;
 use thiserror::Error;
+use tokio::task::JoinError;
 
 #[derive(Debug, StructOpt)]
 pub struct Opt {
@@ -109,6 +112,11 @@ enum LoadChannelsError {
     Other(#[from] anyhow::Error),
 }
 
+enum FetchError {
+    JoinError(JoinError),
+    FetchError(FetchRepoDataError),
+}
+
 /// Interactively loads the [`RepoData`] of the specified channels.
 async fn load_channels<'c, I: IntoIterator<Item = &'c Channel> + 'c>(
     channels: I,
@@ -157,7 +165,7 @@ async fn load_channels<'c, I: IntoIterator<Item = &'c Channel> + 'c>(
                 channel
                     .platforms_or_default()
                     .into_iter()
-                    .map(move |platform| (channel, *platform))
+                    .map(move |platform| (channel.clone(), *platform))
             })
             .map(move |(channel, platform)| {
                 // Create progress bar
@@ -169,7 +177,7 @@ async fn load_channels<'c, I: IntoIterator<Item = &'c Channel> + 'c>(
                 let client = client.clone();
                 let errorred_progress_tyle = errorred_progress_tyle.clone();
                 let finished_progress_tyle = finished_progress_tyle.clone();
-                async move {
+                tokio::spawn(async move {
                     match channel
                         .fetch_repo_data(&client, platform, |progress| match progress {
                             FetchRepoDataProgress::Downloading { progress, total } => {
@@ -195,10 +203,11 @@ async fn load_channels<'c, I: IntoIterator<Item = &'c Channel> + 'c>(
                             progress_bar.set_prefix(format!("{}/{}", &channel.name, platform));
                             progress_bar.set_message("Error!");
                             progress_bar.finish();
-                            Err(err)
+                            Err(FetchError::FetchError(err))
                         }
                     }
-                }
+                })
+                .unwrap_or_else(|e| Err(FetchError::JoinError(e)))
             }),
     )
     .await
@@ -207,9 +216,23 @@ async fn load_channels<'c, I: IntoIterator<Item = &'c Channel> + 'c>(
 
     if !errors.is_empty() {
         Err(LoadChannelsError::FetchErrors(
-            errors.into_iter().map(Result::unwrap_err).collect(),
+            errors
+                .into_iter()
+                .filter_map(|result| match result.unwrap_err() {
+                    FetchError::JoinError(e) => {
+                        if let Ok(reason) = e.try_into_panic() {
+                            panic::resume_unwind(reason);
+                        }
+                        None
+                    }
+                    FetchError::FetchError(e) => Some(e),
+                })
+                .collect(),
         ))
     } else {
-        Ok(repo_datas.into_iter().map(Result::unwrap).collect())
+        Ok(repo_datas
+            .into_iter()
+            .map(|r| unsafe { r.unwrap_unchecked() })
+            .collect())
     }
 }

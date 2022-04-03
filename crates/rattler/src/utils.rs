@@ -20,6 +20,7 @@ macro_rules! regex {
 pub use regex;
 use serde::de::Error;
 use serde_with::DeserializeAs;
+use tokio::task::JoinError;
 
 pub struct MatchSpecStr;
 
