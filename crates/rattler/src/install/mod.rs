@@ -12,6 +12,7 @@ use reqwest_middleware::{ClientBuilder, ClientWithMiddleware};
 use reqwest_retry::policies::ExponentialBackoff;
 use reqwest_retry::RetryTransientMiddleware;
 use sha2::{Digest, Sha256};
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use thiserror::Error;
@@ -152,7 +153,7 @@ async fn install_package(
         tokio::task::spawn_blocking(move || read_paths_from_archive(&index_archive_path))
             .unwrap_or_else(|e| Err(e.into()))
     };
-    let (index, paths) = tokio::try_join!(index_future, paths_future)?;
+    let (index, paths): (Index, Paths) = tokio::try_join!(index_future, paths_future)?;
 
     // Wait for python to complete before linking noarch packages
     let python_info = if matches!(index.noarch, Some(NoArchType::Python)) {
@@ -178,6 +179,15 @@ async fn install_package(
         } else {
             prefix.join(&entry.relative_path)
         };
+
+        // If this is a python file that we have to compile
+        if let Some(python_info) = python_info.as_ref() {
+            if entry.relative_path.starts_with("site-packages/")
+                && entry.relative_path.extension().and_then(OsStr::to_str) == Some("py")
+            {
+                log::info!("queing for compilation {}", entry.relative_path.display());
+            }
+        }
 
         // Spawn the actual file system operation on the rayon threadpool. This is a blocking
         // operation which performs much better when running in a rayon threadpool instead of in
