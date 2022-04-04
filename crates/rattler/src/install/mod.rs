@@ -1,8 +1,8 @@
+mod link;
 mod python;
 
 use crate::install::python::PythonInfo;
-use crate::package_archive::{FileMode, Index, NoArchType, PathEntry, PathType, Paths};
-use crate::Version;
+use crate::package_archive::{Index, NoArchType, PackageArchiveFormat, PathEntry, Paths};
 use anyhow::Context;
 use futures::stream::FuturesUnordered;
 use futures::{FutureExt, TryFutureExt, TryStreamExt};
@@ -12,17 +12,14 @@ use reqwest_middleware::{ClientBuilder, ClientWithMiddleware};
 use reqwest_retry::policies::ExponentialBackoff;
 use reqwest_retry::RetryTransientMiddleware;
 use sha2::{Digest, Sha256};
-use std::borrow::Borrow;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use thiserror::Error;
 use tokio::fs;
 use tokio::io;
-use tokio::io::{AsyncBufRead, BufReader};
+use tokio::io::BufReader;
 use tokio::sync::watch;
 use tokio_stream::StreamExt;
-use tokio_tar::Archive;
 use tokio_util::codec::{BytesCodec, FramedRead};
 use tokio_util::io::StreamReader;
 use url::Url;
@@ -158,24 +155,47 @@ async fn install_package(
     let (index, paths) = tokio::try_join!(index_future, paths_future)?;
 
     // Wait for python to complete before linking noarch packages
-    if matches!(index.noarch, Some(NoArchType::Python)) {
-        python_link_state.wait_for_info().await?;
-    }
+    let python_info = if matches!(index.noarch, Some(NoArchType::Python)) {
+        Some(python_link_state.wait_for_info().await?)
+    } else {
+        None
+    };
 
     // Install all files
     let mut link_tasks = FuturesUnordered::new();
-    for entry in paths.paths.iter() {
-        let link_task = {
-            let archive_path = archive_path.clone();
-            let prefix = prefix.clone();
-            let entry = entry.clone();
-            let no_arch_type = index.noarch;
-            tokio_rayon::spawn(move || {
-                link_entry(&archive_path, &prefix, &entry, no_arch_type).with_context(move || {
-                    format!("error linking `{}`", entry.relative_path.display())
-                })
-            })
+    for entry in paths.paths.into_iter() {
+        let archive_path = archive_path.clone();
+        let prefix = prefix.clone();
+
+        // Determine the source & destination path
+        let source_path = archive_path.join(&entry.relative_path);
+        let destination_path = if let Some(python_info) = python_info.as_ref() {
+            prefix.join(
+                python_info
+                    .get_python_noarch_target_path(&entry.relative_path)
+                    .as_ref(),
+            )
+        } else {
+            prefix.join(&entry.relative_path)
         };
+
+        // Spawn the actual file system operation on the rayon threadpool. This is a blocking
+        // operation which performs much better when running in a rayon threadpool instead of in
+        // the tokio threadpool.
+        // TODO: Maybe in the future this might no longer be the case.
+        let link_task = tokio_rayon::spawn(move || {
+            log::trace!("linking {}", entry.relative_path.display());
+            link::link_file(
+                &prefix,
+                &source_path,
+                &destination_path,
+                entry.prefix_placeholder.as_ref().map(String::as_str),
+                entry.path_type,
+                entry.file_mode,
+                !entry.no_link,
+            )
+            .with_context(move || format!("error linking `{}`", entry.relative_path.display()))
+        });
         link_tasks.push(link_task);
     }
 
@@ -213,242 +233,6 @@ fn read_index_from_archive(archive_path: &Path) -> anyhow::Result<Index> {
         .and_then(|f| {
             serde_json::from_reader(std::io::BufReader::new(f)).map_err(anyhow::Error::new)
         })
-}
-
-/// Called to link an entry from the package cache into a prefix.
-fn link_entry(
-    archive_path: &Path,
-    prefix: &Path,
-    entry: &PathEntry,
-    no_arch_type: Option<NoArchType>,
-) -> anyhow::Result<(String, PathBuf)> {
-    log::trace!("linking {}", entry.relative_path.display());
-
-    // Determine the source & destination path
-    // TODO: Determine the path based on whether this is a no_arch python package or not.
-    let source_path = archive_path.join(&entry.relative_path);
-    // let destination_path = if matches!(no_arch_type, Some(NoArchType::Python)) {
-    // } else {
-    //     prefix.join(&entry.relative_path)
-    // };
-    let destination_path = prefix.join(&entry.relative_path);
-
-    // Ensure all directories up to the path exist
-    if let Some(parent) = destination_path.parent() {
-        if !parent.exists() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("could not create parent directory structure"))?;
-        }
-    }
-
-    // If the path already exists, remove it
-    // TODO: Properly handle clobbering here
-    if destination_path.is_file() {
-        log::warn!(
-            "Clobbering: $CONDA_PREFIX/{}",
-            entry.relative_path.display()
-        );
-        std::fs::remove_file(&destination_path)
-            .with_context(|| format!("error removing existing file"))?;
-    }
-
-    if let Some(old_prefix) = &entry.prefix_placeholder {
-        // Determine the new prefix for the file
-        let new_prefix = &prefix.to_string_lossy();
-        let digest = match entry.file_mode {
-            FileMode::Text => {
-                // TODO: Replace '\\' with '/' in prefix on windows
-                copy_replace_prefix_text(&source_path, &destination_path, old_prefix, &new_prefix)?
-            }
-            FileMode::Binary => {
-                let source_meta = std::fs::metadata(&source_path)
-                    .context("unable to determine permissions of cached file")?;
-                let digest = copy_replace_prefix_binary(
-                    &source_path,
-                    &destination_path,
-                    old_prefix,
-                    &new_prefix,
-                )?;
-                std::fs::set_permissions(destination_path, source_meta.permissions())
-                    .context("unable to assign same permissions as source file")?;
-                digest
-            }
-        };
-
-        return Ok((digest, entry.relative_path.clone()));
-    } else if entry.path_type == PathType::HardLink && !entry.no_link {
-        hard_link_entry(&source_path, &destination_path)?;
-    } else if entry.path_type == PathType::SoftLink && !entry.no_link {
-        soft_link_entry(&source_path, &destination_path)?;
-    } else {
-        copy_entry(&source_path, &destination_path)?;
-    };
-
-    Ok((entry.sha256.clone(), entry.relative_path.clone()))
-}
-
-/// Copy the file from the source to the destination while replacing the `old_prefix` with the
-/// `new_prefix` in binary occurrences.
-fn copy_replace_prefix_binary(
-    source_path: &Path,
-    destination_path: &Path,
-    old_prefix: &str,
-    new_prefix: &str,
-) -> anyhow::Result<String> {
-    // Memory map the source file
-    let source = {
-        let file = std::fs::File::open(source_path).context("unable to open file from cache")?;
-        unsafe { memmap2::Mmap::map(&file) }.context("unable to memory map file from cache")?
-    };
-
-    // Open the output file for writing
-    let mut destination = std::fs::File::create(destination_path)
-        .context("unable to open destination file for writing")?;
-
-    // Get the prefixes as bytes
-    let old_prefix = old_prefix.as_bytes();
-    let new_prefix = new_prefix.as_bytes();
-
-    let padding_len = if old_prefix.len() > new_prefix.len() {
-        old_prefix.len() - new_prefix.len()
-    } else {
-        0
-    };
-    let padding = vec![0u8; padding_len];
-
-    let mut digest = Sha256::new();
-    let mut source_bytes = source.as_ref();
-    loop {
-        if let Some(index) = twoway::find_bytes(source_bytes, old_prefix) {
-            // Find the end of the c-style string
-            let mut end = index + old_prefix.len();
-            while end < source.len() && source_bytes[end] != 0 {
-                end += 1;
-            }
-
-            // Get the suffix part
-            let suffix = &source_bytes[index + old_prefix.len()..end];
-
-            // Write to disk
-            destination
-                .write_all(&source_bytes[..index])
-                .and_then(|_| destination.write_all(new_prefix))
-                .and_then(|_| destination.write_all(suffix))
-                .and_then(|_| destination.write_all(&padding))
-                .context("failed to write to destination")?;
-
-            // Update digest
-            digest.update(&source_bytes[..index]);
-            digest.update(new_prefix);
-            digest.update(suffix);
-            digest.update(&padding);
-
-            // Continue with the rest of the bytes
-            source_bytes = &source_bytes[end..];
-        } else {
-            // Write to disk
-            destination
-                .write_all(&source_bytes)
-                .context("failed to write to destination")?;
-
-            // Update digest
-            digest.update(&source_bytes);
-
-            return Ok(format!("{:x}", digest.finalize()));
-        }
-    }
-}
-
-/// Copy the file from the source to the destination while replacing the `old_prefix` with the
-/// `new_prefix` by searching for text occurrences.
-fn copy_replace_prefix_text(
-    source_path: &Path,
-    destination_path: &Path,
-    old_prefix: &str,
-    new_prefix: &str,
-) -> anyhow::Result<String> {
-    // Memory map the source file
-    let source = {
-        let file = std::fs::File::open(source_path).context("unable to open file from cache")?;
-        unsafe { memmap2::Mmap::map(&file) }.context("unable to memory map file from cache")?
-    };
-
-    // Open the output file for writing
-    let mut destination = std::fs::File::create(destination_path)
-        .context("unable to open destination file for writing")?;
-
-    // Get the prefixes as bytes
-    let old_prefix = old_prefix.as_bytes();
-    let new_prefix = new_prefix.as_bytes();
-
-    // TODO: Update shebang if present
-
-    let mut digest = Sha256::new();
-    let mut source_bytes = source.as_ref();
-    loop {
-        if let Some(index) = twoway::find_bytes(source_bytes, old_prefix) {
-            // Write to disk
-            destination
-                .write_all(&source_bytes[..index])
-                .and_then(|_| destination.write_all(new_prefix))
-                .context("failed to write to destination")?;
-
-            // Update digest
-            digest.update(&source_bytes[..index]);
-            digest.update(new_prefix);
-
-            source_bytes = &source_bytes[index + old_prefix.len()..];
-        } else {
-            // Write to disk
-            destination
-                .write_all(&source_bytes)
-                .context("failed to write to destination")?;
-
-            // Update digest
-            digest.update(&source_bytes);
-
-            return Ok(format!("{:x}", digest.finalize()));
-        }
-    }
-}
-
-/// Hard links an entry from the source archive to the destination. Falls back to soft-linking or
-/// copying if hard-linking fails.
-fn hard_link_entry(source_path: &Path, destination_path: &Path) -> anyhow::Result<()> {
-    std::fs::hard_link(source_path, destination_path)
-        .or_else(|e| {
-            log::debug!("unable to hardlink `{}`: {}", destination_path.display(), e);
-            std::fs::soft_link(source_path, destination_path)
-        })
-        .or_else(|e| {
-            log::debug!("unable to softlink `{}`: {}", destination_path.display(), e);
-            std::fs::copy(source_path, destination_path).map(|_| ())
-        })
-        .context("error hard linking entry")
-}
-
-/// Soft links an entry from the source archive to the destination. Falls back to copying if
-/// soft-linking fails.
-fn soft_link_entry(source_path: &Path, destination_path: &Path) -> anyhow::Result<()> {
-    std::fs::soft_link(source_path, destination_path)
-        .or_else(|e| {
-            log::debug!("unable to softlink `{}`: {}", destination_path.display(), e);
-            std::fs::copy(source_path, destination_path).map(|_| ())
-        })
-        .context("error soft linking entry")
-}
-
-/// Copies an entry from the source archive to the destination.
-fn copy_entry(source_path: &Path, destination_path: &Path) -> anyhow::Result<()> {
-    std::fs::copy(source_path, destination_path)
-        .map(|_| ())
-        .context("error copying entry")
-}
-
-enum LinkType {
-    HardLink,
-    SoftLink,
-    Copy,
 }
 
 /// Ensures that the package with the given `package_file_name` exists in the directory specified by
@@ -524,65 +308,6 @@ async fn fetch_and_extract(
 
     // Report success
     log::debug!("extracted {package_url} to {}", destination.display());
-
-    Ok(())
-}
-
-/// Extracts a `.tar.bz2` archive to the specified destination
-async fn extract_tar_bz2(
-    bytes: impl AsyncBufRead + Send + Unpin,
-    destination: &Path,
-) -> anyhow::Result<()> {
-    let decompressed_bytes = async_compression::tokio::bufread::BzDecoder::new(bytes);
-    Archive::new(decompressed_bytes).unpack(destination).await?;
-    Ok(())
-}
-
-/// Extracts a `.tar.zstd` archive to the specified destination
-async fn extract_tar_zstd(
-    bytes: impl AsyncBufRead + Send + Unpin,
-    destination: &Path,
-) -> anyhow::Result<()> {
-    let decompressed_bytes = async_compression::tokio::bufread::ZstdDecoder::new(bytes);
-    Archive::new(decompressed_bytes).unpack(destination).await?;
-    Ok(())
-}
-
-/// Extracts a `.conda` archive to the specified destination
-async fn extract_conda(
-    bytes: impl AsyncBufRead + Send + Unpin,
-    destination: &Path,
-) -> anyhow::Result<()> {
-    let mut zip_reader = async_zip::read::stream::ZipFileReader::new(bytes);
-    while let Some(mut entry) = zip_reader
-        .entry_reader()
-        .await
-        .with_context(|| format!("failed to read zip entry"))?
-    {
-        let entry_name = entry.entry().name();
-
-        // Skip metadata
-        if entry_name == "metadata.json" {
-            entry.read_to_end_crc().await?;
-            continue;
-        }
-
-        let (_, archive_format) = PackageArchiveFormat::from_file_name(entry_name)
-            .ok_or_else(|| anyhow::anyhow!("unknown archive format for `{entry_name}`"))?;
-
-        let buf_reader = BufReader::new(&mut entry);
-        match archive_format {
-            PackageArchiveFormat::TarBz2 => extract_tar_bz2(buf_reader, destination).await?,
-            PackageArchiveFormat::TarZst => extract_tar_zstd(buf_reader, destination).await?,
-            PackageArchiveFormat::Conda => {
-                anyhow::bail!("conda archive cannot contain more conda archives")
-            }
-        }
-
-        if !entry.compare_crc() {
-            anyhow::bail!("CRC of zip entry does not match read content")
-        }
-    }
 
     Ok(())
 }
@@ -710,40 +435,4 @@ async fn validate_package(archive_path: &PathBuf) -> Result<(), ValidationError>
     }
 
     Ok(())
-}
-
-#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
-enum PackageArchiveFormat {
-    TarBz2,
-    TarZst,
-    Conda,
-}
-
-impl PackageArchiveFormat {
-    /// Determine the format of an archive based on the file name of a package. Returns the format
-    /// and the original name of the package (without archive extension).
-    pub fn from_file_name(file_name: &str) -> Option<(&str, Self)> {
-        if let Some(name) = file_name.strip_suffix(".tar.bz2") {
-            Some((name, PackageArchiveFormat::TarBz2))
-        } else if let Some(name) = file_name.strip_suffix(".conda") {
-            Some((name, PackageArchiveFormat::Conda))
-        } else if let Some(name) = file_name.strip_suffix(".tar.zst") {
-            Some((name, PackageArchiveFormat::TarZst))
-        } else {
-            None
-        }
-    }
-
-    /// Given an archive data stream extract the contents to a specific location
-    pub async fn unpack(
-        &self,
-        bytes: impl AsyncBufRead + Send + Unpin,
-        destination: &Path,
-    ) -> anyhow::Result<()> {
-        match self {
-            PackageArchiveFormat::TarBz2 => extract_tar_bz2(bytes, destination).await,
-            PackageArchiveFormat::Conda => extract_conda(bytes, destination).await,
-            PackageArchiveFormat::TarZst => extract_tar_zstd(bytes, destination).await,
-        }
-    }
 }

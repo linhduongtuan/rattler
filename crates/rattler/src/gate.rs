@@ -28,7 +28,7 @@ impl Gate {
     /// Opens the gate, so all pending tasks can continue. Returns true if the gate was closed,
     /// false otherwise.
     pub fn open(&self) -> bool {
-        let mut state = self.state.lock().expect("gate lock was poisoned");
+        let state = self.state.lock().expect("gate lock was poisoned");
 
         if *state.waker.borrow() == true {
             return false;

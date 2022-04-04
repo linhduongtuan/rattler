@@ -1,5 +1,6 @@
 use crate::Version;
-use std::path::PathBuf;
+use std::borrow::Cow;
+use std::path::{Path, PathBuf};
 use thiserror::Error;
 
 /// Information required for linking no-arch python packages.
@@ -13,6 +14,9 @@ pub struct PythonInfo {
 
     /// The relative path to where site-packages are stored
     site_packages_path: PathBuf,
+
+    /// Path to the binary directory
+    bin_dir: PathBuf,
 }
 
 #[derive(Debug, Clone, Error)]
@@ -42,10 +46,29 @@ impl PythonInfo {
         let site_packages_path =
             PathBuf::from(format!("lib/python{}.{}/site-packages", major, minor));
 
+        // Binary directory
+        #[cfg(windows)]
+        let bin_dir = PathBuf::from("Scripts");
+        #[cfg(not(windows))]
+        let bin_dir = PathBuf::from("bin");
+
         Ok(Self {
             short_version: (major, minor),
             path,
             site_packages_path,
+            bin_dir,
         })
+    }
+
+    /// Returns the target location of a file in a noarch python package given its location in its
+    /// package archive.
+    pub fn get_python_noarch_target_path<'a>(&self, relative_path: &'a Path) -> Cow<'a, Path> {
+        if let Ok(rest) = relative_path.strip_prefix("site-packages/") {
+            self.site_packages_path.join(rest).into()
+        } else if let Ok(rest) = relative_path.strip_prefix("python-scripts/") {
+            self.bin_dir.join(rest).into()
+        } else {
+            relative_path.into()
+        }
     }
 }

@@ -1,7 +1,7 @@
 use crate::{ChannelConfig, MatchSpec, Version};
 use fxhash::{FxHashMap, FxHashSet};
-use serde::{Deserialize, Deserializer};
-use serde_with::{serde_as, DeserializeAs};
+use serde::Deserialize;
+use serde_with::serde_as;
 use std::fmt::{Display, Formatter};
 
 /// [`RepoData`] is an index of package binaries available on in a subdirectory of a Conda channel.

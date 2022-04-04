@@ -1,4 +1,3 @@
-use crate::version_spec::VersionOperator;
 use crate::{Channel, ParseVersionError, Version};
 use futures::{future, StreamExt, TryStreamExt};
 use std::collections::HashSet;
