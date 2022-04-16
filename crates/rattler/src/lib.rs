@@ -1,3 +1,4 @@
+mod activated_command;
 mod channel;
 mod environment_spec;
 mod gate;

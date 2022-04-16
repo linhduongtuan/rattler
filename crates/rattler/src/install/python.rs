@@ -60,6 +60,11 @@ impl PythonInfo {
         })
     }
 
+    /// Returns the path to the python executable
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
     /// Returns the target location of a file in a noarch python package given its location in its
     /// package archive.
     pub fn get_python_noarch_target_path<'a>(&self, relative_path: &'a Path) -> Cow<'a, Path> {

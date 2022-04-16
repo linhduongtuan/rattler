@@ -1,6 +1,8 @@
+mod compile;
 mod link;
 mod python;
 
+use crate::install::compile::PythonCompiler;
 use crate::install::python::PythonInfo;
 use crate::package_archive::{Index, NoArchType, PackageArchiveFormat, PathEntry, Paths};
 use anyhow::Context;
@@ -44,11 +46,16 @@ fn construct_client() -> ClientWithMiddleware {
 
 type LazyClient = Arc<Lazy<ClientWithMiddleware>>;
 
-#[derive(Clone, Debug)]
+struct PythonContext {
+    pub info: PythonInfo,
+    pub compiler: PythonCompiler,
+}
+
+#[derive(Clone)]
 struct PythonLinkStatus {
     has_python: bool,
-    sender: Arc<Mutex<watch::Sender<Option<Arc<PythonInfo>>>>>,
-    receiver: watch::Receiver<Option<Arc<PythonInfo>>>,
+    sender: Arc<Mutex<watch::Sender<Option<Arc<PythonContext>>>>>,
+    receiver: watch::Receiver<Option<Arc<PythonContext>>>,
 }
 
 #[derive(Clone, Debug, Error)]
@@ -67,7 +74,7 @@ impl PythonLinkStatus {
         }
     }
 
-    async fn wait_for_info(&self) -> Result<Arc<PythonInfo>, PythonLinkStatusError> {
+    async fn wait_for_info(&self) -> Result<Arc<PythonContext>, PythonLinkStatusError> {
         if !self.has_python {
             return Err(PythonLinkStatusError::NoPackageProvidesPython);
         }
@@ -81,7 +88,7 @@ impl PythonLinkStatus {
         }
     }
 
-    fn set(&self, info: PythonInfo) {
+    fn set(&self, info: PythonContext) {
         let lock = self.sender.lock().expect("lock is poisoned");
         let _ = lock.send(Some(Arc::new(info)));
     }
@@ -163,6 +170,7 @@ async fn install_package(
     };
 
     // Install all files
+    // let mut compile_tasks = FuturesUnordered::new();
     let mut link_tasks = FuturesUnordered::new();
     for entry in paths.paths.into_iter() {
         let archive_path = archive_path.clone();
@@ -173,6 +181,7 @@ async fn install_package(
         let destination_path = if let Some(python_info) = python_info.as_ref() {
             prefix.join(
                 python_info
+                    .info
                     .get_python_noarch_target_path(&entry.relative_path)
                     .as_ref(),
             )
@@ -181,13 +190,17 @@ async fn install_package(
         };
 
         // If this is a python file that we have to compile
-        if let Some(python_info) = python_info.as_ref() {
+        let compile_context = if let Some(python_info) = python_info.as_ref() {
             if entry.relative_path.starts_with("site-packages/")
                 && entry.relative_path.extension().and_then(OsStr::to_str) == Some("py")
             {
-                log::info!("queing for compilation {}", entry.relative_path.display());
+                Some((destination_path.clone(), python_info.clone()))
+            } else {
+                None
             }
-        }
+        } else {
+            None
+        };
 
         // Spawn the actual file system operation on the rayon threadpool. This is a blocking
         // operation which performs much better when running in a rayon threadpool instead of in
@@ -205,6 +218,18 @@ async fn install_package(
                 !entry.no_link,
             )
             .with_context(move || format!("error linking `{}`", entry.relative_path.display()))
+        })
+        .and_then(|_| async {
+            if let Some((path, python_context)) = compile_context {
+                python_context
+                    .compiler
+                    .compile(&path)
+                    .await
+                    .map(|_| ())
+                    .with_context(|| format!("compiling python file {}", path.display()))
+            } else {
+                Ok(())
+            }
         });
         link_tasks.push(link_task);
     }
@@ -217,7 +242,9 @@ async fn install_package(
     // If we just installed python, update the python information channel so other packages that
     // require python in their linking process can continue.
     if package_name == "python" {
-        python_link_state.set(PythonInfo::from_version(&index.version)?);
+        let info = PythonInfo::from_version(&index.version)?;
+        let compiler = PythonCompiler::new(&prefix, info.path());
+        python_link_state.set(PythonContext { info, compiler });
     }
 
     log::info!("finished linking {}", &package_name);
