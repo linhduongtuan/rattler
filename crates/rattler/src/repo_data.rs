@@ -31,7 +31,7 @@ pub struct ChannelInfo {
 /// A single record in the Conda repodata. A single record refers to a single binary distribution
 /// of a package on a Conda channel.
 #[serde_as]
-#[derive(Debug, Deserialize, Eq, PartialEq, Ord, PartialOrd, Clone)]
+#[derive(Debug, Deserialize, Eq, PartialEq, Ord, PartialOrd, Clone, Hash)]
 pub struct PackageRecord {
     pub name: String,
     #[serde(deserialize_with = "version_from_str")]

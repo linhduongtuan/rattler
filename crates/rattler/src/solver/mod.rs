@@ -3,7 +3,7 @@ use crate::{
     ChannelConfig, MatchSpec, MatchSpecConstraints, PackageRecord, RepoData, Version,
     VersionSpec,
 };
-use fxhash::FxHashMap;
+use fxhash::{FxHashMap, FxHashSet};
 use itertools::Itertools;
 use pubgrub::solver::{Dependencies, DependencyProvider};
 use std::borrow::Borrow;
@@ -12,7 +12,7 @@ use pubgrub::range::Range;
 
 #[derive(Default)]
 pub struct PackageRecordIndex {
-    versions: FxHashMap<Version, Vec<PackageRecord>>,
+    versions: FxHashSet<PackageRecord>,
 }
 
 #[derive(Default)]
@@ -28,9 +28,7 @@ impl From<Vec<RepoData>> for PackageIndex {
                 let package_index = index.packages.entry(record.name.clone()).or_default();
                 package_index
                     .versions
-                    .entry(record.version.clone())
-                    .or_default()
-                    .push(record);
+                    .insert(record);
             }
         }
         index
@@ -42,9 +40,7 @@ impl PackageIndex {
         let package_index = self.packages.entry(record.name.clone()).or_default();
         package_index
             .versions
-            .entry(record.version.clone())
-            .or_default()
-            .push(record);
+            .insert(record);
     }
 
     pub fn available_versions(&self, package: &String) -> impl Iterator<Item = &PackageRecord> {
@@ -52,8 +48,7 @@ impl PackageIndex {
         self.packages
             .get(package)
             .into_iter()
-            .flat_map(|package_index| package_index.versions.values())
-            .flatten()
+            .flat_map(|package_index| package_index.versions.iter())
             .sorted()
             .rev()
         // .collect_vec();

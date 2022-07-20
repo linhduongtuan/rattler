@@ -1,7 +1,8 @@
-use crate::{MatchSpec, PackageRecord, Version};
+use crate::{DistinctRange, MatchSpec, PackageRecord, Version};
 use itertools::Itertools;
 use once_cell::sync::OnceCell;
 use pubgrub::version_set::VersionSet;
+use pubgrub::{range::Range, version::Version as DistinctVersion};
 use smallvec::SmallVec;
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
@@ -9,16 +10,41 @@ use std::fmt::{Display, Formatter};
 use std::hash::{Hash, Hasher};
 use std::iter::once;
 use std::sync::RwLock;
-use pubgrub::range::Range;
 
 static COMPLEMENT_CACHE: OnceCell<RwLock<HashMap<MatchSpecConstraints, MatchSpecConstraints>>> =
     OnceCell::new();
+
+#[repr(transparent)]
+#[derive(Ord, PartialOrd, Eq, PartialEq, Hash, Debug, Clone, Copy)]
+pub struct BuildNumber(usize);
+
+impl From<usize> for BuildNumber {
+    fn from(b: usize) -> Self {
+        BuildNumber(b)
+    }
+}
+
+impl Display for BuildNumber {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl DistinctVersion for BuildNumber {
+    fn lowest() -> Self {
+        BuildNumber(0)
+    }
+
+    fn bump(&self) -> Self {
+        BuildNumber(self.0 + 1)
+    }
+}
 
 /// A single AND group in a `MatchSpecConstraints`
 #[derive(Debug, Clone, Eq, PartialEq, Hash)]
 pub struct MatchSpecElement {
     version: Range<Version>,
-    build_number: Range<usize>,
+    build_number: Option<DistinctRange<BuildNumber>>,
 }
 
 impl MatchSpecElement {
@@ -26,7 +52,7 @@ impl MatchSpecElement {
     fn none() -> Self {
         Self {
             version: Range::empty(),
-            build_number: Range::empty(),
+            build_number: None,
         }
     }
 
@@ -34,15 +60,21 @@ impl MatchSpecElement {
     fn any() -> Self {
         Self {
             version: Range::full(),
-            build_number: Range::full(),
+            build_number: None,
         }
     }
 
     /// Returns the intersection of this element and another
     fn intersection(&self, other: &Self) -> Self {
         let version = self.version.intersection(&other.version);
-        let build_number = self.build_number.intersection(&other.build_number);
-        if version == Range::empty() || build_number == Range::empty() {
+        let build_number = self.build_number.as_ref().map(|range| {
+            other
+                .build_number
+                .as_ref()
+                .map(|other| DistinctRange::intersection(range, other))
+                .unwrap_or_else(|| range.clone())
+        }).or_else(|| other.build_number.clone());
+        if version == Range::empty() || build_number == Some(DistinctRange::none()) {
             Self::none()
         } else {
             Self {
@@ -54,7 +86,11 @@ impl MatchSpecElement {
 
     /// Returns true if the specified packages matches this instance
     pub fn contains(&self, package: &PackageRecord) -> bool {
-        self.version.contains(&package.version) && self.build_number.contains(&package.build_number)
+        self.version.contains(&package.version)
+            && self
+                .build_number.as_ref()
+                .map(|range| range.contains(&BuildNumber(package.build_number)))
+                .unwrap_or(true)
     }
 }
 
@@ -68,12 +104,15 @@ impl From<MatchSpec> for MatchSpecConstraints {
     fn from(spec: MatchSpec) -> Self {
         Self {
             groups: vec![MatchSpecElement {
-                version: spec.version.map(Into::into).unwrap_or_else(|| Range::full()),
+                version: spec
+                    .version
+                    .map(Into::into)
+                    .unwrap_or_else(|| Range::full()),
                 build_number: spec
                     .build_number
                     .clone()
-                    .map(Range::singleton)
-                    .unwrap_or_else(|| Range::full()),
+                    .map(BuildNumber)
+                    .map(DistinctRange::exact)
             }],
         }
     }
@@ -87,7 +126,25 @@ impl From<MatchSpecElement> for MatchSpecConstraints {
 
 impl Display for MatchSpecConstraints {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", &self.groups[0].version)
+        if self.groups.is_empty() {
+            write!(f, "<empty>")?;
+        } else {
+            for i in 0..self.groups.len() {
+                if i > 0 {
+                    write!(f, ", ")?;
+                }
+                write!(
+                    f,
+                    "{}",
+                    &self.groups[i].version
+                )?;
+                if let Some(build_number_range) = &self.groups[i].build_number {
+                    write!(f, "[build={}]", build_number_range)?;
+                }
+            }
+        }
+
+        Ok(())
     }
 }
 
@@ -105,16 +162,18 @@ impl MatchSpecConstraints {
                 if version_complement != Range::empty() {
                     group_entries.push(MatchSpecElement {
                         version: version_complement,
-                        build_number: Range::full(),
+                        build_number: None,
                     });
                 }
 
-                let build_complement = spec.build_number.complement();
-                if build_complement != Range::empty() {
-                    group_entries.push(MatchSpecElement {
-                        version: Range::full(),
-                        build_number: spec.build_number.complement(),
-                    });
+                if let Some(build_number) = &spec.build_number {
+                    let build_complement = build_number.negate();
+                    if build_complement != DistinctRange::none() {
+                        group_entries.push(MatchSpecElement {
+                            version: Range::full(),
+                            build_number: Some(build_complement),
+                        });
+                    }
                 }
 
                 permutations.push(group_entries);
@@ -156,7 +215,7 @@ impl VersionSet for MatchSpecConstraints {
         Self {
             groups: vec![MatchSpecElement {
                 version: Range::full(),
-                build_number: Range::full(),
+                build_number: None,
             }],
         }
     }
@@ -165,7 +224,7 @@ impl VersionSet for MatchSpecConstraints {
         Self {
             groups: vec![MatchSpecElement {
                 version: Range::singleton(v.version),
-                build_number: Range::singleton(v.build_number),
+                build_number: Some(DistinctRange::exact(v.build_number)),
             }],
         }
     }

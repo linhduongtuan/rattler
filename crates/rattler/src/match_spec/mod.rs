@@ -4,6 +4,7 @@ use serde_with::skip_serializing_none;
 use std::fmt::{Debug, Display, Formatter};
 
 mod parse;
+mod glob_string;
 
 /// A `MatchSpec` is, fundamentally, a query language for conda packages. Any of the fields that
 /// comprise a [`PackageRecord`] can be used to compose a `MatchSpec`.

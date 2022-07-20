@@ -7,6 +7,8 @@ mod solver;
 pub(crate) mod utils;
 mod version;
 mod version_spec;
+mod distinct_range;
+pub(crate) mod internal;
 
 pub use channel::{
     Channel, ChannelConfig, FetchRepoDataError, FetchRepoDataProgress, ParseChannelError,
@@ -18,3 +20,4 @@ pub use repo_data::{ChannelInfo, NoArchType, PackageRecord, RepoData};
 pub use solver::{PackageIndex, SolverIndex};
 pub use version::{ParseVersionError, ParseVersionErrorKind, Version};
 pub use version_spec::VersionSpec;
+pub use distinct_range::DistinctRange;
