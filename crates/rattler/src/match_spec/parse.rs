@@ -45,6 +45,9 @@ pub enum ParseMatchSpecError {
 
     #[error("invalid version spec: {0}")]
     InvalidVersionSpec(#[from] ParseVersionSpecError),
+
+    #[error("invalid glob: {0}")]
+    InvalidGlob(String),
 }
 
 impl MatchSpec {
@@ -321,7 +324,10 @@ fn parse(input: &str, channel_config: &ChannelConfig) -> Result<MatchSpec, Parse
         );
 
         if let Some(build) = build_str {
-            match_spec.build = Some(build.to_owned());
+            match_spec.build = Some(
+                glob::Pattern::new(build)
+                    .map_err(|_| ParseMatchSpecError::InvalidGlob(build.to_owned()))?,
+            )
         }
     }
 

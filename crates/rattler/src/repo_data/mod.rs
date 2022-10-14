@@ -13,6 +13,9 @@ use serde_with::{serde_as, skip_serializing_none, DisplayFromStr, OneOrMany};
 use crate::{NoArchType, Version};
 
 pub mod fetch;
+mod lazy;
+
+pub use lazy::LazyRepoData;
 
 /// [`RepoData`] is an index of package binaries available on in a subdirectory of a Conda channel.
 #[derive(Debug, Deserialize, Eq, PartialEq)]

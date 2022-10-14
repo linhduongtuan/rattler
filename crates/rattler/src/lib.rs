@@ -9,6 +9,8 @@
 //! interfacing with many other languages (WASM, Javascript, Python, C, etc) and is therefor a good
 //! candidate for a reimplementation.
 
+extern crate core;
+
 mod channel;
 mod channel_data;
 mod match_spec;

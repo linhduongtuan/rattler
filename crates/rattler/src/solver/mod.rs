@@ -1,4 +1,5 @@
 mod libsolv;
+mod resolver;
 
 use std::collections::HashMap;
 

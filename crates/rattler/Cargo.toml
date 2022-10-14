@@ -39,13 +39,17 @@ tokio-util = { version = "0.7.3", features = ["codec", "io"] }
 tracing = "0.1.29"
 url = { version = "2.2.2", features = ["serde"] }
 
+pubgrub = { git="https://github.com/pubgrub-rs/pubgrub.git", branch="dev" }
+bit-vec = "0.6.3"
+glob = "0.3.0"
+
 [dev-dependencies]
 rand = "0.8.4"
 insta = { version="1.16.0", features=["yaml"] }
 proptest = "1.0.0"
 axum = "0.5.13"
 tower-http = { version="0.3.4", features=["fs", "compression-gzip"] }
-tokio-test = "0.4.2"
+tokio = { version = "1.12.0", features = ["test-util", "macros"] }
 
 [build-dependencies]
 cc = "1"
