@@ -23,6 +23,25 @@ impl<'i> LazyPackageRecord<'i> {
     }
 }
 
+impl<'i> LazyRepoData<'i> {
+    pub fn find_all<'s>(
+        &'s self,
+        package: &'s str,
+    ) -> impl Iterator<Item = Result<&'s PackageRecord, serde_json::Error>> + 's {
+        self.packages.iter().filter_map(move |(filename, record)| {
+            if filename.starts_with(&format!("{}-", package)) {
+                match record.as_parsed() {
+                    Ok(record) if &record.name == package => Some(Ok(record)),
+                    Err(e) => Some(Err(e)),
+                    Ok(_) => None,
+                }
+            } else {
+                None
+            }
+        })
+    }
+}
+
 impl<'i, 'de: 'i> Deserialize<'de> for LazyPackageRecord<'i> {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where

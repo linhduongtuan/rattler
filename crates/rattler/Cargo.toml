@@ -39,7 +39,7 @@ tokio-util = { version = "0.7.3", features = ["codec", "io"] }
 tracing = "0.1.29"
 url = { version = "2.2.2", features = ["serde"] }
 
-pubgrub = { git="https://github.com/pubgrub-rs/pubgrub.git", branch="dev" }
+pubgrub = { git="https://github.com/baszalmstra/pubgrub.git", branch="feat/constrains" }
 bit-vec = "0.6.3"
 glob = "0.3.0"
 

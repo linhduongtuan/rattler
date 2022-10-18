@@ -1,10 +1,11 @@
 use crate::repo_data::LazyRepoData;
-use crate::{ChannelConfig, MatchSpec, PackageRecord};
+use crate::{ChannelConfig, MatchSpec, PackageRecord, Version};
 use bit_vec::BitVec;
 use itertools::Itertools;
-use pubgrub::solver::Dependencies;
+use pubgrub::solver::{Dependencies, Requirement, RequirementKind};
 use pubgrub::type_aliases::DependencyConstraints;
 use pubgrub::version_set::VersionSet;
+use std::rc::Rc;
 use std::{
     borrow::Borrow,
     cell::RefCell,
@@ -12,23 +13,28 @@ use std::{
     collections::HashMap,
     error::Error,
     fmt::{Debug, Display, Formatter},
-    sync::Arc,
 };
+use std::cell::Cell;
 
 /// A complete set of all versions and variants of a single package.
 struct PackageVersionSet {
     name: String,
-    variants: Vec<PackageRecord>,
+    variants: RefCell<Vec<PackageRecord>>,
+    sorted: Cell<bool>,
 }
 
 impl PackageVersionSet {
-    pub fn range_from_matchspec(self: Arc<Self>, match_spec: &MatchSpec) -> PackageVersionRange {
-        let mut included = BitVec::from_elem(self.variants.len(), false);
-        for (idx, variant) in self.variants.iter().enumerate() {
+    pub fn range_from_matchspec(self: Rc<Self>, match_spec: &MatchSpec) -> PackageVersionRange {
+        debug_assert!(self.sorted.get());
+        let variants = self.variants.borrow();
+        let mut included = BitVec::from_elem(variants.len(), false);
+        for (idx, variant) in variants.iter().enumerate() {
             if match_spec.matches(variant) {
                 included.set(idx, true)
             }
         }
+        drop(variants);
+
         if included.none() {
             PackageVersionRange::Empty
         } else if included.all() {
@@ -44,25 +50,27 @@ impl PackageVersionSet {
 
 #[derive(Clone)]
 struct PackageVersionId {
-    version_set: Arc<PackageVersionSet>,
+    version_set: Rc<PackageVersionSet>,
     index: usize,
 }
 
 impl Debug for PackageVersionId {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", &self.version_set.variants[self.index])
+        let variants = self.version_set.variants.borrow();
+        write!(f, "{}", &variants[self.index])
     }
 }
 
 impl Display for PackageVersionId {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", &self.version_set.variants[self.index])
+        let variants = self.version_set.variants.borrow();
+        write!(f, "{}", &variants[self.index])
     }
 }
 
 impl PartialEq for PackageVersionId {
     fn eq(&self, other: &Self) -> bool {
-        debug_assert!(Arc::ptr_eq(&self.version_set, &other.version_set));
+        debug_assert!(Rc::ptr_eq(&self.version_set, &other.version_set));
         self.index == other.index
     }
 }
@@ -70,14 +78,14 @@ impl Eq for PackageVersionId {}
 
 impl PartialOrd for PackageVersionId {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        debug_assert!(Arc::ptr_eq(&self.version_set, &other.version_set));
+        debug_assert!(Rc::ptr_eq(&self.version_set, &other.version_set));
         self.index.partial_cmp(&other.index)
     }
 }
 
 impl Ord for PackageVersionId {
     fn cmp(&self, other: &Self) -> Ordering {
-        debug_assert!(Arc::ptr_eq(&self.version_set, &other.version_set));
+        debug_assert!(Rc::ptr_eq(&self.version_set, &other.version_set));
         self.index.cmp(&other.index)
     }
 }
@@ -101,7 +109,7 @@ impl Display for PackageVersionRange {
 
 #[derive(Clone)]
 struct DiscretePackageVersionRange {
-    version_set: Arc<PackageVersionSet>,
+    version_set: Rc<PackageVersionSet>,
     included: BitVec,
 }
 
@@ -122,7 +130,7 @@ impl Display for DiscretePackageVersionRange {
             .enumerate()
             .filter_map(|(index, selected)| {
                 if selected {
-                    Some(self.version_set.variants[index].to_string())
+                    Some(self.version_set.variants.borrow()[index].to_string())
                 } else {
                     None
                 }
@@ -148,7 +156,7 @@ impl From<DiscretePackageVersionRange> for PackageVersionRange {
 
 impl DiscretePackageVersionRange {
     pub fn singleton(v: PackageVersionId) -> Self {
-        let mut included = BitVec::from_elem(v.version_set.variants.len(), false);
+        let mut included = BitVec::from_elem(v.version_set.variants.borrow().len(), false);
         included.set(v.index, true);
         DiscretePackageVersionRange {
             version_set: v.version_set,
@@ -166,7 +174,7 @@ impl DiscretePackageVersionRange {
     }
 }
 
-impl pubgrub::version_set::VersionSet for PackageVersionRange {
+impl VersionSet for PackageVersionRange {
     type V = PackageVersionId;
 
     fn empty() -> Self {
@@ -200,7 +208,7 @@ impl pubgrub::version_set::VersionSet for PackageVersionRange {
                 other.clone()
             }
             (PackageVersionRange::Discrete(a), PackageVersionRange::Discrete(b)) => {
-                debug_assert!(Arc::ptr_eq(&a.version_set, &b.version_set));
+                debug_assert!(Rc::ptr_eq(&a.version_set, &b.version_set));
                 let mut included = a.included.clone();
                 included.and(&b.included);
                 if included.none() {
@@ -236,7 +244,7 @@ impl pubgrub::version_set::VersionSet for PackageVersionRange {
                 PackageVersionRange::Full
             }
             (PackageVersionRange::Discrete(a), PackageVersionRange::Discrete(b)) => {
-                debug_assert!(Arc::ptr_eq(&a.version_set, &b.version_set));
+                debug_assert!(Rc::ptr_eq(&a.version_set, &b.version_set));
                 let mut included = a.included.clone();
                 included.or(&b.included);
                 if included.all() {
@@ -254,8 +262,9 @@ impl pubgrub::version_set::VersionSet for PackageVersionRange {
 }
 
 impl PackageVersionSet {
-    fn available_versions(self: Arc<Self>) -> impl Iterator<Item = PackageVersionId> {
-        (0..self.variants.len()).map(move |index| PackageVersionId {
+    fn available_versions(self: Rc<Self>) -> impl Iterator<Item = PackageVersionId> {
+        let len = self.variants.borrow().len();
+        (0..len).map(move |index| PackageVersionId {
             version_set: self.clone(),
             index,
         })
@@ -263,19 +272,25 @@ impl PackageVersionSet {
 }
 
 struct Index<'i> {
-    cached_dependencies: RefCell<HashMap<String, Arc<PackageVersionSet>>>,
+    cached_dependencies: RefCell<HashMap<String, Rc<PackageVersionSet>>>,
     repo_datas: Vec<LazyRepoData<'i>>,
     channel_config: ChannelConfig,
 }
 
 impl<'i> Index<'i> {
-    fn version_set(&self, package: &String) -> Result<Arc<PackageVersionSet>, Box<dyn Error>> {
+    fn version_set(
+        &self,
+        package: &String,
+        sorted: bool,
+    ) -> Result<Rc<PackageVersionSet>, Box<dyn Error>> {
         let borrow = self.cached_dependencies.borrow();
-        Ok(if let Some(entry) = borrow.get(package) {
-            entry.clone()
+        let version_set = if let Some(entry) = borrow.get(package) {
+            let result = entry.clone();
+            drop(borrow);
+            result
         } else {
             drop(borrow);
-            let mut variants = self
+            let variants = self
                 .repo_datas
                 .iter()
                 .flat_map(|repo| repo.packages.iter())
@@ -293,21 +308,112 @@ impl<'i> Index<'i> {
                 .map_ok(Clone::clone)
                 .collect::<Result<Vec<_>, _>>()?;
 
-            variants.sort();
-            variants.reverse();
-
-            if variants.is_empty() {
-                return Err(anyhow::anyhow!("No package entries found for '{package}'").into());
-            }
-
-            let set = Arc::new(PackageVersionSet {
+            let set = Rc::new(PackageVersionSet {
                 name: package.clone(),
-                variants,
+                variants: RefCell::new(variants),
+                sorted: Cell::new(false),
             });
+
             self.cached_dependencies
                 .borrow_mut()
-                .insert(package.clone(), set.clone());
-            set
+                .entry(package.clone())
+                .or_insert(set)
+                .clone()
+        };
+
+        if sorted && !version_set.sorted.get() {
+            version_set.variants.borrow_mut().sort_by(|a, b| {
+                let a_has_tracked_features = a.track_features.is_empty();
+                let b_has_tracked_features = b.track_features.is_empty();
+                b_has_tracked_features
+                    .cmp(&a_has_tracked_features)
+                    .then_with(|| b.version.cmp(&a.version))
+                    .then_with(|| b.build_number.cmp(&a.build_number))
+                    .then_with(|| {
+                        let a_match_specs = a
+                            .depends
+                            .iter()
+                            .filter_map(|spec| {
+                                match MatchSpec::from_str(&spec, &self.channel_config) {
+                                    Ok(spec) => {
+                                        spec.name.clone().map(|name| (name, spec))
+                                    }
+                                    Err(_) => None,
+                                }
+                            })
+                            .collect::<HashMap<_, _>>();
+                        let b_match_specs = b
+                            .depends
+                            .iter()
+                            .filter_map(|spec| {
+                                match MatchSpec::from_str(&spec, &self.channel_config) {
+                                    Ok(spec) => {
+                                        spec.name.clone().map(|name| (name, spec))
+                                    }
+                                    Err(_) => None,
+                                }
+                            })
+                            .collect::<HashMap<_, _>>();
+
+                        let mut total_score = 0;
+                        for (dependency, a_spec) in a_match_specs.iter() {
+                            if let Some(b_spec) = b_match_specs.get(dependency) {
+                                let highest_a = self.find_highest_version(a_spec);
+                                let highest_b = self.find_highest_version(b_spec);
+                                // dbg!(&a_spec.name, &highest_a, &highest_b);
+                                let score = match (highest_a, highest_b) {
+                                    (None, Some(_)) => 1,
+                                    (Some(_), None) => -1,
+                                    (
+                                        Some((a_version, a_tracked_features)),
+                                        Some((b_version, b_tracked_features)),
+                                    ) => {
+                                        if a_tracked_features != b_tracked_features {
+                                            if a_tracked_features {
+                                                100
+                                            } else {
+                                                -100
+                                            }
+                                        } else {
+                                            if a_version > b_version {
+                                                -1
+                                            } else {
+                                                1
+                                            }
+                                        }
+                                    }
+                                    _ => 0,
+                                };
+                                total_score += score;
+                            }
+                        }
+
+                        total_score.cmp(&0)
+                    }).then_with(|| b.timestamp.cmp(&a.timestamp))
+            });
+            version_set.sorted.set(true);
+        }
+
+        Ok(version_set.clone())
+    }
+
+    fn find_highest_version(&self, match_spec: &MatchSpec) -> Option<(Version, bool)> {
+        let name = match_spec.name.as_ref()?;
+        let version_set = self.version_set(&name, false).ok()?;
+        let variants = version_set.variants.borrow();
+        let matching_records = variants
+            .iter()
+            .filter(|&record| match_spec.matches(record));
+        matching_records.fold(None, |init, record| {
+            Some(init.map_or_else(
+                || (record.version.clone(), !record.track_features.is_empty()),
+                |(version, has_tracked_features)| {
+                    (
+                        version.max(record.version.clone()),
+                        has_tracked_features && record.track_features.is_empty(),
+                    )
+                },
+            ))
         })
     }
 
@@ -315,7 +421,7 @@ impl<'i> Index<'i> {
         &self,
         package: &String,
     ) -> Result<impl Iterator<Item = PackageVersionId>, Box<dyn Error>> {
-        Ok(self.version_set(package)?.available_versions())
+        Ok(self.version_set(package, true)?.available_versions())
     }
 }
 
@@ -338,26 +444,50 @@ impl<'i> pubgrub::solver::DependencyProvider<String, PackageVersionRange> for In
         version: &PackageVersionId,
     ) -> Result<Dependencies<String, PackageVersionRange>, Box<dyn Error>> {
         debug_assert!(package == &version.version_set.name);
-        let record = &version.version_set.variants[version.index];
-        let mut dependencies: DependencyConstraints<String, PackageVersionRange> =
+        let variants = version.version_set.variants.borrow();
+        let record = &variants[version.index];
+        let mut dependencies: DependencyConstraints<String, Requirement<PackageVersionRange>> =
             DependencyConstraints::default();
+
+        for constraint in record.constrains.iter() {
+            let match_spec = MatchSpec::from_str(constraint, &self.channel_config)?;
+            let name = match_spec
+                .name
+                .as_ref()
+                .expect("matchspec without package name");
+
+            let version_set = self.version_set(name, true)?;
+            let range = version_set.range_from_matchspec(&match_spec);
+
+            dependencies
+                .entry(name.clone())
+                .and_modify(|spec| {
+                    spec.range = spec.range.intersection(&range);
+                })
+                .or_insert_with(|| Requirement::from_constraint(range));
+        }
+
         for dependency in record.depends.iter() {
-            dbg!(dependency);
             let match_spec = MatchSpec::from_str(dependency, &self.channel_config)?;
             let name = match_spec
                 .name
                 .as_ref()
                 .expect("matchspec without package name");
-            let version_set = self.version_set(name)?;
+
+            let version_set = self.version_set(name, true)?;
+            if version_set.variants.borrow().is_empty() {
+                return Err(anyhow::anyhow!("no entries found for package `{}`", name).into());
+            }
 
             let range = version_set.range_from_matchspec(&match_spec);
 
             dependencies
                 .entry(name.clone())
                 .and_modify(|spec| {
-                    *spec = spec.intersection(&range);
+                    spec.range = spec.range.intersection(&range);
+                    spec.kind = RequirementKind::Required;
                 })
-                .or_insert(range);
+                .or_insert_with(|| Requirement::from_dependency(range));
         }
 
         Ok(Dependencies::Known(dependencies))
@@ -366,13 +496,14 @@ impl<'i> pubgrub::solver::DependencyProvider<String, PackageVersionRange> for In
 
 #[cfg(test)]
 mod test {
+    use std::cell::{Cell, RefCell};
     use crate::repo_data::LazyRepoData;
     use crate::solver::resolver::{Index, PackageVersionId, PackageVersionSet};
     use crate::{PackageRecord, Version};
     use pubgrub::error::PubGrubError;
     use pubgrub::report::{DefaultStringReporter, Reporter};
+    use std::rc::Rc;
     use std::str::FromStr;
-    use std::sync::Arc;
 
     fn conda_json_path() -> String {
         format!(
@@ -399,9 +530,10 @@ mod test {
         let noarch_repo_data: LazyRepoData = serde_json::from_str(&noarch_repo_data_str).unwrap();
 
         let root_package_name = String::from("__ROOT__");
-        let version_set = Arc::new(PackageVersionSet {
+        let version_set = Rc::new(PackageVersionSet {
             name: root_package_name.clone(),
-            variants: vec![PackageRecord {
+            sorted: Cell::new(true),
+            variants: RefCell::new(vec![PackageRecord {
                 name: root_package_name.clone(),
                 version: Version::from_str("0").unwrap(),
                 build: "".to_string(),
@@ -412,7 +544,7 @@ mod test {
                 sha256: None,
                 arch: None,
                 platform: None,
-                depends: vec![String::from("python =3.9")],
+                depends: vec![String::from("ogre")],
                 constrains: vec![],
                 track_features: vec![],
                 features: None,
@@ -423,7 +555,7 @@ mod test {
                 timestamp: None,
                 date: None,
                 size: None,
-            }],
+            }]),
         });
 
         let root_version = PackageVersionId {
@@ -432,7 +564,7 @@ mod test {
         };
 
         let index = Index {
-            repo_datas: vec![linux64_repo_data, noarch_repo_data],
+            repo_datas: vec![noarch_repo_data, linux64_repo_data],
             cached_dependencies: Default::default(),
             channel_config: Default::default(),
         };
@@ -455,47 +587,29 @@ mod test {
 
         // "__ROOT__": __ROOT__=0=,
         // "_libgcc_mutex": _libgcc_mutex=0.1=conda_forge,
-        // "_openmp_mutex": _openmp_mutex=4.5=2_kmp_llvm,
+        // "_openmp_mutex": _openmp_mutex=4.5=2_gnu,
         // "bzip2": bzip2=1.0.8=h7f98852_4,
-        // "ca-certificates": ca-certificates=2022.6.15=ha878542_0,
-        // "ld_impl_linux-64": ld_impl_linux-64=2.36.1=hea4e1c9_2,
-        // "libffi": libffi=3.4.2=h9c3ff4c_4,
-        // "libgcc-ng": libgcc-ng=12.1.0=h8d9b700_16,
-        // "libnsl": libnsl=2.0.0=h7f98852_0,
-        // "libsqlite": libsqlite=3.39.2=h753d276_1,
-        // "libstdcxx-ng": libstdcxx-ng=12.1.0=ha89aaad_16,
-        // "libuuid": libuuid=2.32.1=h7f98852_1000,
-        // "libzlib": libzlib=1.2.12=h166bdaf_2,
-        // "llvm-openmp": llvm-openmp=14.0.4=he0ac6c6_0,
-        // "ncurses": ncurses=6.3=h9c3ff4c_0,
-        // "openssl": openssl=1.1.1q=h166bdaf_0,
-        // "python": python=3.9.13=h9a8a25e_0_cpython,
-        // "readline": readline=8.1.2=h0f457ee_0,
-        // "sqlite": sqlite=3.39.2=h4ff8645_1,
-        // "tk": tk=8.6.12=h27826a3_0,
-        // "tzdata": tzdata=2021e=he74cb21_0,
+        // "c-ares": c-ares=1.18.1=h7f98852_0,
+        // "ca-certificates": ca-certificates=2022.9.24=ha878542_0,
+        // "cmake": cmake=3.24.2=h5432695_0,
+        // "expat": expat=2.4.9=h27087fc_0,
+        // "keyutils": keyutils=1.6.1=h166bdaf_0,
+        // "krb5": krb5=1.19.3=h08a2579_0,
+        // "libcurl": libcurl=7.85.0=h2283fc2_0,
+        // "libedit": libedit=3.1.20191231=he28a2e2_2,
+        // "libev": libev=4.33=h516909a_1,
+        // "libgcc-ng": libgcc-ng=12.2.0=h65d4601_18,
+        // "libgomp": libgomp=12.2.0=h65d4601_18,
+        // "libnghttp2": libnghttp2=1.47.0=hff17c54_1,
+        // "libssh2": libssh2=1.10.0=hf14f497_3,
+        // "libstdcxx-ng": libstdcxx-ng=12.2.0=h46fd767_18,
+        // "libuv": libuv=1.44.2=h166bdaf_0,
+        // "libzlib": libzlib=1.2.13=h166bdaf_4,
+        // "ncurses": ncurses=6.3=h27087fc_1,
+        // "openssl": openssl=3.0.5=h166bdaf_2,
+        // "rhash": rhash=1.4.3=h166bdaf_0,
         // "xz": xz=5.2.6=h166bdaf_0,
-
-        // Install - SolvableInfo { name: "_libgcc_mutex", version: "0.1", build_string: Some("conda_forge"), build_number: Some(0) }
-        // Install - SolvableInfo { name: "_openmp_mutex", version: "4.5", build_string: Some("1_llvm"), build_number: Some(1) }
-        // Install - SolvableInfo { name: "bzip2", version: "1.0.8", build_string: Some("h7f98852_4"), build_number: Some(4) }
-        // Install - SolvableInfo { name: "ca-certificates", version: "2022.6.15", build_string: Some("ha878542_0"), build_number: Some(0) }
-        // Install - SolvableInfo { name: "ld_impl_linux-64", version: "2.36.1", build_string: Some("hea4e1c9_0"), build_number: Some(0) }
-        // Install - SolvableInfo { name: "libffi", version: "3.4.2", build_string: Some("h9c3ff4c_2"), build_number: Some(2) }
-        // Install - SolvableInfo { name: "libgcc-ng", version: "12.1.0", build_string: Some("h8d9b700_16"), build_number: Some(16) }
-        // Install - SolvableInfo { name: "libnsl", version: "2.0.0", build_string: Some("h7f98852_0"), build_number: Some(0) }
-        // Install - SolvableInfo { name: "libstdcxx-ng", version: "12.1.0", build_string: Some("ha89aaad_16"), build_number: Some(16) }
-        // Install - SolvableInfo { name: "libuuid", version: "2.32.1", build_string: Some("h7f98852_1000"), build_number: Some(1000) }
-        // Install - SolvableInfo { name: "libzlib", version: "1.2.12", build_string: Some("h166bdaf_1"), build_number: Some(1) }
-        // Install - SolvableInfo { name: "llvm-openmp", version: "14.0.4", build_string: Some("he0ac6c6_0"), build_number: Some(0) }
-        // Install - SolvableInfo { name: "ncurses", version: "6.3", build_string: Some("h9c3ff4c_0"), build_number: Some(0) }
-        // Install - SolvableInfo { name: "openssl", version: "1.1.1q", build_string: Some("h166bdaf_0"), build_number: Some(0) }
-        // Install - SolvableInfo { name: "python", version: "3.9.13", build_string: Some("h9a8a25e_0_cpython"), build_number: Some(0) }
-        // Install - SolvableInfo { name: "readline", version: "8.1.2", build_string: Some("h0f457ee_0"), build_number: Some(0) }
-        // Install - SolvableInfo { name: "sqlite", version: "3.39.2", build_string: Some("h4ff8645_0"), build_number: Some(0) }
-        // Install - SolvableInfo { name: "tk", version: "8.6.12", build_string: Some("h27826a3_0"), build_number: Some(0) }
-        // Install - SolvableInfo { name: "tzdata", version: "2021e", build_string: Some("he74cb21_0"), build_number: Some(0) }
-        // Install - SolvableInfo { name: "xz", version: "5.2.6", build_string: Some("h166bdaf_0"), build_number: Some(0) }
-        // Install - SolvableInfo { name: "zlib", version: "1.2.12", build_string: Some("h166bdaf_1"), build_number: Some(1) }
+        // "zlib": zlib=1.2.13=h166bdaf_4,
+        // "zstd": zstd=1.5.2=h6239696_4,
     }
 }
