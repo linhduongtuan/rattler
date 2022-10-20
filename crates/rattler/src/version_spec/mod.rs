@@ -193,7 +193,9 @@ impl VersionSpec {
             VersionSpec::Operator(VersionOperator::Less, limit) => version < limit,
             VersionSpec::Operator(VersionOperator::LessEquals, limit) => version <= limit,
             VersionSpec::Operator(VersionOperator::StartsWith, limit) => version.starts_with(limit),
-            VersionSpec::Operator(VersionOperator::NotStartsWith, limit) => !version.starts_with(limit),
+            VersionSpec::Operator(VersionOperator::NotStartsWith, limit) => {
+                !version.starts_with(limit)
+            }
             VersionSpec::Operator(VersionOperator::Compatible, limit) => version >= limit,
             VersionSpec::Operator(VersionOperator::NotCompatible, limit) => version < limit,
             VersionSpec::Group(LogicalOperator::And, group) => {

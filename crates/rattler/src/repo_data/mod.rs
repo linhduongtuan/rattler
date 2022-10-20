@@ -94,3 +94,31 @@ impl Display for PackageRecord {
         write!(f, "{}={}={}", self.name, self.version, self.build)
     }
 }
+
+impl PackageRecord {
+    pub fn new(name: String, version: Version, build: String, build_number: usize) -> Self {
+        Self {
+            name,
+            version,
+            build,
+            build_number,
+            subdir: Default::default(),
+            filename: None,
+            md5: None,
+            sha256: None,
+            arch: None,
+            platform: None,
+            depends: vec![],
+            constrains: vec![],
+            track_features: vec![],
+            features: None,
+            noarch: Default::default(),
+            preferred_env: None,
+            license: None,
+            license_family: None,
+            timestamp: None,
+            date: None,
+            size: None,
+        }
+    }
+}

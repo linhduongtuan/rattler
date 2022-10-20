@@ -1,7 +1,9 @@
+use crate::match_spec::ParseMatchSpecError;
 use crate::repo_data::LazyRepoData;
 use crate::{ChannelConfig, MatchSpec, PackageRecord, Version};
 use bit_vec::BitVec;
 use itertools::Itertools;
+use once_cell::unsync::OnceCell;
 use pubgrub::solver::{Dependencies, Requirement, RequirementKind};
 use pubgrub::type_aliases::DependencyConstraints;
 use pubgrub::version_set::VersionSet;
@@ -14,33 +16,37 @@ use std::{
     error::Error,
     fmt::{Debug, Display, Formatter},
 };
-use std::cell::Cell;
 
 /// A complete set of all versions and variants of a single package.
-struct PackageVersionSet {
+struct PackageVariants {
     name: String,
-    variants: RefCell<Vec<PackageRecord>>,
-    sorted: Cell<bool>,
+
+    /// A list of all records
+    variants: Vec<PackageRecord>,
+
+    /// The order of variants when sorted according to resolver rules
+    by_order: OnceCell<Vec<usize>>,
+
+    /// List of dependencies of a specific record
+    dependencies: Vec<OnceCell<Vec<MatchSpec>>>,
 }
 
-impl PackageVersionSet {
-    pub fn range_from_matchspec(self: Rc<Self>, match_spec: &MatchSpec) -> PackageVersionRange {
-        debug_assert!(self.sorted.get());
-        let variants = self.variants.borrow();
-        let mut included = BitVec::from_elem(variants.len(), false);
-        for (idx, variant) in variants.iter().enumerate() {
+impl PackageVariants {
+    pub fn range_from_matchspec(self: Rc<Self>, match_spec: &MatchSpec) -> PackageVariantSet {
+        // Construct a bitset that includes
+        let mut included = BitVec::from_elem(self.variants.len(), false);
+        for (idx, variant) in self.variants.iter().enumerate() {
             if match_spec.matches(variant) {
                 included.set(idx, true)
             }
         }
-        drop(variants);
 
         if included.none() {
-            PackageVersionRange::Empty
+            PackageVariantSet::Empty
         } else if included.all() {
-            PackageVersionRange::Full
+            PackageVariantSet::Full
         } else {
-            PackageVersionRange::Discrete(DiscretePackageVersionRange {
+            PackageVariantSet::Discrete(PackageVariantRange {
                 version_set: self,
                 included,
             })
@@ -49,41 +55,47 @@ impl PackageVersionSet {
 }
 
 #[derive(Clone)]
-struct PackageVersionId {
-    version_set: Rc<PackageVersionSet>,
+struct VariantId {
+    version_set: Rc<PackageVariants>,
     index: usize,
 }
 
-impl Debug for PackageVersionId {
+impl VariantId {
+    pub fn name(&self) -> &str {
+        &self.version_set.name
+    }
+}
+
+impl Debug for VariantId {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        let variants = self.version_set.variants.borrow();
+        let variants = &self.version_set.variants;
         write!(f, "{}", &variants[self.index])
     }
 }
 
-impl Display for PackageVersionId {
+impl Display for VariantId {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        let variants = self.version_set.variants.borrow();
+        let variants = &&self.version_set.variants;
         write!(f, "{}", &variants[self.index])
     }
 }
 
-impl PartialEq for PackageVersionId {
+impl PartialEq for VariantId {
     fn eq(&self, other: &Self) -> bool {
         debug_assert!(Rc::ptr_eq(&self.version_set, &other.version_set));
         self.index == other.index
     }
 }
-impl Eq for PackageVersionId {}
+impl Eq for VariantId {}
 
-impl PartialOrd for PackageVersionId {
+impl PartialOrd for VariantId {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         debug_assert!(Rc::ptr_eq(&self.version_set, &other.version_set));
         self.index.partial_cmp(&other.index)
     }
 }
 
-impl Ord for PackageVersionId {
+impl Ord for VariantId {
     fn cmp(&self, other: &Self) -> Ordering {
         debug_assert!(Rc::ptr_eq(&self.version_set, &other.version_set));
         self.index.cmp(&other.index)
@@ -91,29 +103,38 @@ impl Ord for PackageVersionId {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-enum PackageVersionRange {
+enum PackageVariantSet {
     Empty,
     Full,
-    Discrete(DiscretePackageVersionRange),
+    Discrete(PackageVariantRange),
 }
 
-impl Display for PackageVersionRange {
+impl Display for PackageVariantSet {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
-            PackageVersionRange::Empty => write!(f, "!"),
-            PackageVersionRange::Full => write!(f, "*"),
-            PackageVersionRange::Discrete(discrete) => write!(f, "{}", discrete),
+            PackageVariantSet::Empty => write!(f, "!"),
+            PackageVariantSet::Full => write!(f, "*"),
+            PackageVariantSet::Discrete(discrete) => write!(f, "{}", discrete),
         }
     }
 }
 
 #[derive(Clone)]
-struct DiscretePackageVersionRange {
-    version_set: Rc<PackageVersionSet>,
+struct PackageVariantRange {
+    version_set: Rc<PackageVariants>,
     included: BitVec,
 }
 
-impl Debug for DiscretePackageVersionRange {
+impl PackageVariantRange {
+    #[inline]
+    pub fn contains_variant_index(&self, idx: usize) -> bool {
+        self.included
+            .get(idx)
+            .expect("could not sample outside of available package versions")
+    }
+}
+
+impl Debug for PackageVariantRange {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DiscretePackageVersionRange")
             .field("version_set", &self.version_set.name)
@@ -122,7 +143,7 @@ impl Debug for DiscretePackageVersionRange {
     }
 }
 
-impl Display for DiscretePackageVersionRange {
+impl Display for PackageVariantRange {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         let versions = self
             .included
@@ -130,7 +151,7 @@ impl Display for DiscretePackageVersionRange {
             .enumerate()
             .filter_map(|(index, selected)| {
                 if selected {
-                    Some(self.version_set.variants.borrow()[index].to_string())
+                    Some(self.version_set.variants[index].to_string())
                 } else {
                     None
                 }
@@ -140,25 +161,25 @@ impl Display for DiscretePackageVersionRange {
     }
 }
 
-impl PartialEq for DiscretePackageVersionRange {
+impl PartialEq for PackageVariantRange {
     fn eq(&self, other: &Self) -> bool {
         self.included.eq(&other.included)
     }
 }
 
-impl Eq for DiscretePackageVersionRange {}
+impl Eq for PackageVariantRange {}
 
-impl From<DiscretePackageVersionRange> for PackageVersionRange {
-    fn from(range: DiscretePackageVersionRange) -> Self {
-        PackageVersionRange::Discrete(range)
+impl From<PackageVariantRange> for PackageVariantSet {
+    fn from(range: PackageVariantRange) -> Self {
+        PackageVariantSet::Discrete(range)
     }
 }
 
-impl DiscretePackageVersionRange {
-    pub fn singleton(v: PackageVersionId) -> Self {
-        let mut included = BitVec::from_elem(v.version_set.variants.borrow().len(), false);
+impl PackageVariantRange {
+    pub fn singleton(v: VariantId) -> Self {
+        let mut included = BitVec::from_elem(v.version_set.variants.len(), false);
         included.set(v.index, true);
-        DiscretePackageVersionRange {
+        PackageVariantRange {
             version_set: v.version_set,
             included,
         }
@@ -169,13 +190,23 @@ impl DiscretePackageVersionRange {
         included.negate();
         Self {
             version_set: self.version_set.clone(),
-            included: included,
+            included,
         }
     }
 }
 
-impl VersionSet for PackageVersionRange {
-    type V = PackageVersionId;
+impl PackageVariantSet {
+    pub fn contains_variant_index(&self, idx: usize) -> bool {
+        match self {
+            PackageVariantSet::Empty => false,
+            PackageVariantSet::Full => true,
+            PackageVariantSet::Discrete(discrete) => discrete.contains_variant_index(idx),
+        }
+    }
+}
+
+impl VersionSet for PackageVariantSet {
+    type V = VariantId;
 
     fn empty() -> Self {
         Self::Empty
@@ -186,35 +217,33 @@ impl VersionSet for PackageVersionRange {
     }
 
     fn singleton(v: Self::V) -> Self {
-        DiscretePackageVersionRange::singleton(v).into()
+        PackageVariantRange::singleton(v).into()
     }
 
     fn complement(&self) -> Self {
         match self {
-            PackageVersionRange::Empty => PackageVersionRange::Full,
-            PackageVersionRange::Full => PackageVersionRange::Empty,
-            PackageVersionRange::Discrete(discrete) => {
-                PackageVersionRange::Discrete(discrete.complement())
+            PackageVariantSet::Empty => PackageVariantSet::Full,
+            PackageVariantSet::Full => PackageVariantSet::Empty,
+            PackageVariantSet::Discrete(discrete) => {
+                PackageVariantSet::Discrete(discrete.complement())
             }
         }
     }
 
     fn intersection(&self, other: &Self) -> Self {
         match (self, other) {
-            (PackageVersionRange::Empty, _) | (_, PackageVersionRange::Empty) => {
-                PackageVersionRange::Empty
+            (PackageVariantSet::Empty, _) | (_, PackageVariantSet::Empty) => {
+                PackageVariantSet::Empty
             }
-            (PackageVersionRange::Full, other) | (other, PackageVersionRange::Full) => {
-                other.clone()
-            }
-            (PackageVersionRange::Discrete(a), PackageVersionRange::Discrete(b)) => {
+            (PackageVariantSet::Full, other) | (other, PackageVariantSet::Full) => other.clone(),
+            (PackageVariantSet::Discrete(a), PackageVariantSet::Discrete(b)) => {
                 debug_assert!(Rc::ptr_eq(&a.version_set, &b.version_set));
                 let mut included = a.included.clone();
                 included.and(&b.included);
                 if included.none() {
-                    PackageVersionRange::Empty
+                    PackageVariantSet::Empty
                 } else {
-                    DiscretePackageVersionRange {
+                    PackageVariantRange {
                         version_set: a.version_set.clone(),
                         included,
                     }
@@ -225,32 +254,21 @@ impl VersionSet for PackageVersionRange {
     }
 
     fn contains(&self, v: &Self::V) -> bool {
-        match self {
-            PackageVersionRange::Empty => false,
-            PackageVersionRange::Full => true,
-            PackageVersionRange::Discrete(discrete) => discrete
-                .included
-                .get(v.index)
-                .expect("could not sample outside of available package versions"),
-        }
+        self.contains_variant_index(v.index)
     }
 
     fn union(&self, other: &Self) -> Self {
         match (self, other) {
-            (PackageVersionRange::Empty, other) | (other, PackageVersionRange::Empty) => {
-                other.clone()
-            }
-            (PackageVersionRange::Full, _) | (_, PackageVersionRange::Full) => {
-                PackageVersionRange::Full
-            }
-            (PackageVersionRange::Discrete(a), PackageVersionRange::Discrete(b)) => {
+            (PackageVariantSet::Empty, other) | (other, PackageVariantSet::Empty) => other.clone(),
+            (PackageVariantSet::Full, _) | (_, PackageVariantSet::Full) => PackageVariantSet::Full,
+            (PackageVariantSet::Discrete(a), PackageVariantSet::Discrete(b)) => {
                 debug_assert!(Rc::ptr_eq(&a.version_set, &b.version_set));
                 let mut included = a.included.clone();
                 included.or(&b.included);
                 if included.all() {
-                    PackageVersionRange::Full
+                    PackageVariantSet::Full
                 } else {
-                    DiscretePackageVersionRange {
+                    PackageVariantRange {
                         version_set: a.version_set.clone(),
                         included,
                     }
@@ -261,29 +279,47 @@ impl VersionSet for PackageVersionRange {
     }
 }
 
-impl PackageVersionSet {
-    fn available_versions(self: Rc<Self>) -> impl Iterator<Item = PackageVersionId> {
-        let len = self.variants.borrow().len();
-        (0..len).map(move |index| PackageVersionId {
-            version_set: self.clone(),
-            index,
-        })
-    }
-}
-
 struct Index<'i> {
-    cached_dependencies: RefCell<HashMap<String, Rc<PackageVersionSet>>>,
+    /// A cache of package variants
+    package_variants_cache: RefCell<HashMap<String, Rc<PackageVariants>>>,
+
+    /// A cache of highest versions for a given matchspec
+    match_spec_cache: RefCell<HashMap<MatchSpec, (Version, bool)>>,
+
+    /// Repodata used by the index
     repo_datas: Vec<LazyRepoData<'i>>,
+
+    /// Channel configuration used by the index
     channel_config: ChannelConfig,
 }
 
 impl<'i> Index<'i> {
-    fn version_set(
-        &self,
-        package: &String,
-        sorted: bool,
-    ) -> Result<Rc<PackageVersionSet>, Box<dyn Error>> {
-        let borrow = self.cached_dependencies.borrow();
+    /// Adds a virtual package to the index
+    pub fn add_package(&mut self, package: PackageRecord) -> VariantId {
+        let set = Rc::new(PackageVariants {
+            name: package.name.clone(),
+            by_order: Default::default(),
+            dependencies: vec![Default::default()],
+            variants: vec![package],
+        });
+
+        if let Some(previous_package) = self
+            .package_variants_cache
+            .borrow_mut()
+            .insert(set.name.clone(), set.clone())
+        {
+            panic!("duplicate package entry for `{}`", previous_package.name);
+        }
+
+        VariantId {
+            version_set: set,
+            index: 0,
+        }
+    }
+
+    /// Returns information about all the variants of a specific package.
+    fn package_variants(&self, package: &String) -> Result<Rc<PackageVariants>, Box<dyn Error>> {
+        let borrow = self.package_variants_cache.borrow();
         let version_set = if let Some(entry) = borrow.get(package) {
             let result = entry.clone();
             drop(borrow);
@@ -293,118 +329,186 @@ impl<'i> Index<'i> {
             let variants = self
                 .repo_datas
                 .iter()
-                .flat_map(|repo| repo.packages.iter())
-                .filter_map(|(filename, record)| {
-                    if filename.starts_with(&format!("{}-", package)) {
-                        match record.as_parsed() {
-                            Ok(record) if &record.name == package => Some(Ok(record)),
-                            Err(e) => Some(Err(e)),
-                            Ok(_) => None,
-                        }
-                    } else {
-                        None
-                    }
+                .flat_map(|repodata| {
+                    repodata
+                        .packages
+                        .get(package)
+                        .map(IntoIterator::into_iter)
+                        .into_iter()
+                        .flatten()
+                        .map(|record| record.parse())
                 })
-                .map_ok(Clone::clone)
                 .collect::<Result<Vec<_>, _>>()?;
 
-            let set = Rc::new(PackageVersionSet {
+            let set = Rc::new(PackageVariants {
                 name: package.clone(),
-                variants: RefCell::new(variants),
-                sorted: Cell::new(false),
+                by_order: Default::default(),
+                dependencies: (0..variants.len()).map(|_| Default::default()).collect(),
+                variants,
             });
 
-            self.cached_dependencies
+            self.package_variants_cache
                 .borrow_mut()
                 .entry(package.clone())
                 .or_insert(set)
                 .clone()
         };
 
-        if sorted && !version_set.sorted.get() {
-            version_set.variants.borrow_mut().sort_by(|a, b| {
-                let a_has_tracked_features = a.track_features.is_empty();
-                let b_has_tracked_features = b.track_features.is_empty();
-                b_has_tracked_features
-                    .cmp(&a_has_tracked_features)
-                    .then_with(|| b.version.cmp(&a.version))
-                    .then_with(|| b.build_number.cmp(&a.build_number))
-                    .then_with(|| {
-                        let a_match_specs = a
-                            .depends
-                            .iter()
-                            .filter_map(|spec| {
-                                match MatchSpec::from_str(&spec, &self.channel_config) {
-                                    Ok(spec) => {
-                                        spec.name.clone().map(|name| (name, spec))
-                                    }
-                                    Err(_) => None,
-                                }
-                            })
-                            .collect::<HashMap<_, _>>();
-                        let b_match_specs = b
-                            .depends
-                            .iter()
-                            .filter_map(|spec| {
-                                match MatchSpec::from_str(&spec, &self.channel_config) {
-                                    Ok(spec) => {
-                                        spec.name.clone().map(|name| (name, spec))
-                                    }
-                                    Err(_) => None,
-                                }
-                            })
-                            .collect::<HashMap<_, _>>();
-
-                        let mut total_score = 0;
-                        for (dependency, a_spec) in a_match_specs.iter() {
-                            if let Some(b_spec) = b_match_specs.get(dependency) {
-                                let highest_a = self.find_highest_version(a_spec);
-                                let highest_b = self.find_highest_version(b_spec);
-                                // dbg!(&a_spec.name, &highest_a, &highest_b);
-                                let score = match (highest_a, highest_b) {
-                                    (None, Some(_)) => 1,
-                                    (Some(_), None) => -1,
-                                    (
-                                        Some((a_version, a_tracked_features)),
-                                        Some((b_version, b_tracked_features)),
-                                    ) => {
-                                        if a_tracked_features != b_tracked_features {
-                                            if a_tracked_features {
-                                                100
-                                            } else {
-                                                -100
-                                            }
-                                        } else {
-                                            if a_version > b_version {
-                                                -1
-                                            } else {
-                                                1
-                                            }
-                                        }
-                                    }
-                                    _ => 0,
-                                };
-                                total_score += score;
-                            }
-                        }
-
-                        total_score.cmp(&0)
-                    }).then_with(|| b.timestamp.cmp(&a.timestamp))
-            });
-            version_set.sorted.set(true);
-        }
-
-        Ok(version_set.clone())
+        Ok(version_set)
     }
 
+    /// Returns a vec that indicates the order of package variants.
+    fn variants_order<'v>(&self, variants: &'v PackageVariants) -> &'v Vec<usize> {
+        variants.by_order.get_or_init(|| {
+            let mut result = (0..variants.variants.len()).collect_vec();
+            result.sort_by(|&a, &b| self.compare_variants(variants, a, b));
+
+            // eprintln!("-- {}", &variants.name);
+            // for idx in result.iter() {
+            //     let record = &variants.variants[*idx];
+            //     eprintln!("  {}={}={}", &record.name, &record.version, &record.build);
+            // }
+
+            result
+        })
+    }
+
+    /// Returns the order of two package variants based on rules used by conda.
+    fn compare_variants(&self, variants: &PackageVariants, a_idx: usize, b_idx: usize) -> Ordering {
+        let a = &variants.variants[a_idx];
+        let b = &variants.variants[b_idx];
+
+        // First compare by "tracked_features". If one of the packages has a tracked feature it is
+        // sorted below the one that doesnt have the tracked feature.
+        let a_has_tracked_features = a.track_features.is_empty();
+        let b_has_tracked_features = b.track_features.is_empty();
+        match b_has_tracked_features.cmp(&a_has_tracked_features) {
+            Ordering::Less => return Ordering::Less,
+            Ordering::Greater => return Ordering::Greater,
+            Ordering::Equal => {}
+        };
+
+        // Otherwise, select the variant with the highest version
+        match a.version.cmp(&b.version) {
+            Ordering::Less => return Ordering::Greater,
+            Ordering::Greater => return Ordering::Less,
+            Ordering::Equal => {}
+        };
+
+        // Otherwise, select the variant with the highest build number
+        match a.build_number.cmp(&b.build_number) {
+            Ordering::Less => return Ordering::Greater,
+            Ordering::Greater => return Ordering::Less,
+            Ordering::Equal => {}
+        };
+
+        // Otherwise, compare the dependencies of the variants. If there are similar
+        // dependencies select the variant that selects the highest version of the dependency.
+        let empty_vec = Vec::new();
+        let a_match_specs = self.dependencies(variants, a_idx).unwrap_or(&empty_vec);
+        let b_match_specs = self.dependencies(variants, b_idx).unwrap_or(&empty_vec);
+
+        let b_specs_by_name: HashMap<_, _> = b_match_specs
+            .iter()
+            .filter_map(|spec| spec.name.as_ref().map(|name| (name, spec)))
+            .collect();
+
+        let a_specs_by_name = a_match_specs
+            .iter()
+            .filter_map(|spec| spec.name.as_ref().map(|name| (name, spec)));
+
+        let mut total_score = 0;
+        for (a_dep_name, a_spec) in a_specs_by_name {
+            if let Some(b_spec) = b_specs_by_name.get(&a_dep_name) {
+                if &a_spec == b_spec {
+                    continue;
+                }
+
+                // Find which of the two specs selects the highest version
+                let highest_a = self.find_highest_version(a_spec);
+                let highest_b = self.find_highest_version(b_spec);
+
+                // Skip version if no package is selected by either spec
+                let (a_version, a_tracked_features, b_version, b_tracked_features) = if let (
+                    Some((a_version, a_tracked_features)),
+                    Some((b_version, b_tracked_features)),
+                ) =
+                    (highest_a, highest_b)
+                {
+                    (a_version, a_tracked_features, b_version, b_tracked_features)
+                } else {
+                    continue;
+                };
+
+                // If one of the dependencies only selects versions with tracked features, down-
+                // weight that variant.
+                if let Some(score) = match a_tracked_features.cmp(&b_tracked_features) {
+                    Ordering::Less => Some(-100),
+                    Ordering::Greater => Some(100),
+                    Ordering::Equal => None,
+                } {
+                    total_score += score;
+                    continue;
+                }
+
+                // Otherwise, down-weigh the version with the lowest selected version.
+                total_score += match a_version.cmp(&b_version) {
+                    Ordering::Less => 1,
+                    Ordering::Equal => 0,
+                    Ordering::Greater => -1,
+                };
+            }
+        }
+
+        // If ranking the dependencies provides a score, use that for the sorting.
+        match total_score.cmp(&0) {
+            Ordering::Equal => {}
+            ord => return ord,
+        };
+
+        // Otherwise, order by timestamp
+        b.timestamp.cmp(&a.timestamp)
+    }
+
+    /// Returns the dependencies of a specific record of the given `PackageVariants`.
+    pub fn dependencies<'v>(
+        &self,
+        variants: &'v PackageVariants,
+        variant_idx: usize,
+    ) -> Result<&'v Vec<MatchSpec>, ParseMatchSpecError> {
+        variants.dependencies[variant_idx].get_or_try_init(|| {
+            let record = &variants.variants[variant_idx];
+            record
+                .depends
+                .iter()
+                .map(|dep_str| MatchSpec::from_str(dep_str, &self.channel_config))
+                .collect()
+        })
+    }
+
+    // Given a spec determine the highest available version.
     fn find_highest_version(&self, match_spec: &MatchSpec) -> Option<(Version, bool)> {
+        // First try to read from cache
+        let borrow = self.match_spec_cache.borrow();
+        if let Some(result) = borrow.get(match_spec) {
+            return Some(result.clone());
+        }
+        drop(borrow);
+
         let name = match_spec.name.as_ref()?;
-        let version_set = self.version_set(&name, false).ok()?;
-        let variants = version_set.variants.borrow();
-        let matching_records = variants
+
+        // Get all records for the given package
+        let version_set = self.package_variants(name).ok()?;
+
+        // Create an iterator over all records that match
+        let matching_records = version_set
+            .variants
             .iter()
             .filter(|&record| match_spec.matches(record));
-        matching_records.fold(None, |init, record| {
+
+        // Determine the highest version as well as the whether all matching records have tracked
+        // features.
+        let result: Option<(Version, bool)> = matching_records.fold(None, |init, record| {
             Some(init.map_or_else(
                 || (record.version.clone(), !record.track_features.is_empty()),
                 |(version, has_tracked_features)| {
@@ -414,39 +518,52 @@ impl<'i> Index<'i> {
                     )
                 },
             ))
-        })
-    }
+        });
 
-    fn available_versions(
-        &self,
-        package: &String,
-    ) -> Result<impl Iterator<Item = PackageVersionId>, Box<dyn Error>> {
-        Ok(self.version_set(package, true)?.available_versions())
+        // Store in cache for later
+        if let Some(result) = &result {
+            self.match_spec_cache
+                .borrow_mut()
+                .insert(match_spec.clone(), result.clone());
+        }
+
+        result
     }
 }
 
-impl<'i> pubgrub::solver::DependencyProvider<String, PackageVersionRange> for Index<'i> {
-    fn choose_package_version<T: Borrow<String>, U: Borrow<PackageVersionRange>>(
+impl<'i> pubgrub::solver::DependencyProvider<String, PackageVariantSet> for Index<'i> {
+    fn choose_package_version<T: Borrow<String>, U: Borrow<PackageVariantSet>>(
         &self,
-        mut potential_packages: impl Iterator<Item = (T, U)>,
-    ) -> Result<(T, Option<PackageVersionId>), Box<dyn Error>> {
-        let (package, range) = potential_packages.next().unwrap();
-        let version = self
-            .available_versions(package.borrow())?
-            .filter(|v| range.borrow().contains(v))
-            .next();
-        Ok((package, version))
+        potential_packages: impl Iterator<Item = (T, U)>,
+    ) -> Result<(T, Option<VariantId>), Box<dyn Error>> {
+        for (package, range) in potential_packages {
+            let variants = self.package_variants(package.borrow())?;
+            for &variant_idx in self.variants_order(&variants).iter() {
+                if range.borrow().contains_variant_index(variant_idx) {
+                    return Ok((
+                        package,
+                        Some(VariantId {
+                            version_set: variants.clone(),
+                            index: variant_idx,
+                        }),
+                    ));
+                }
+            }
+        }
+
+        Err(anyhow::anyhow!("no packages found that can be chosen").into())
     }
 
     fn get_dependencies(
         &self,
         package: &String,
-        version: &PackageVersionId,
-    ) -> Result<Dependencies<String, PackageVersionRange>, Box<dyn Error>> {
+        version: &VariantId,
+    ) -> Result<Dependencies<String, PackageVariantSet>, Box<dyn Error>> {
         debug_assert!(package == &version.version_set.name);
-        let variants = version.version_set.variants.borrow();
-        let record = &variants[version.index];
-        let mut dependencies: DependencyConstraints<String, Requirement<PackageVersionRange>> =
+        let record = &version.version_set.variants[version.index];
+        let dependencies = self.dependencies(&version.version_set, version.index)?;
+
+        let mut result: DependencyConstraints<String, Requirement<PackageVariantSet>> =
             DependencyConstraints::default();
 
         for constraint in record.constrains.iter() {
@@ -456,10 +573,10 @@ impl<'i> pubgrub::solver::DependencyProvider<String, PackageVersionRange> for In
                 .as_ref()
                 .expect("matchspec without package name");
 
-            let version_set = self.version_set(name, true)?;
+            let version_set = self.package_variants(name)?;
             let range = version_set.range_from_matchspec(&match_spec);
 
-            dependencies
+            result
                 .entry(name.clone())
                 .and_modify(|spec| {
                     spec.range = spec.range.intersection(&range);
@@ -467,21 +584,24 @@ impl<'i> pubgrub::solver::DependencyProvider<String, PackageVersionRange> for In
                 .or_insert_with(|| Requirement::from_constraint(range));
         }
 
-        for dependency in record.depends.iter() {
-            let match_spec = MatchSpec::from_str(dependency, &self.channel_config)?;
+        for match_spec in dependencies {
             let name = match_spec
                 .name
                 .as_ref()
                 .expect("matchspec without package name");
 
-            let version_set = self.version_set(name, true)?;
-            if version_set.variants.borrow().is_empty() {
-                return Err(anyhow::anyhow!("no entries found for package `{}`", name).into());
+            let version_set = self.package_variants(name)?;
+            if version_set.variants.is_empty() {
+                if version_set.name.starts_with("__") {
+                    return Ok(Dependencies::Unknown);
+                } else {
+                    return Err(anyhow::anyhow!("no entries found for package `{}`", name).into());
+                }
             }
 
-            let range = version_set.range_from_matchspec(&match_spec);
+            let range = version_set.range_from_matchspec(match_spec);
 
-            dependencies
+            result
                 .entry(name.clone())
                 .and_modify(|spec| {
                     spec.range = spec.range.intersection(&range);
@@ -490,19 +610,17 @@ impl<'i> pubgrub::solver::DependencyProvider<String, PackageVersionRange> for In
                 .or_insert_with(|| Requirement::from_dependency(range));
         }
 
-        Ok(Dependencies::Known(dependencies))
+        Ok(Dependencies::Known(result))
     }
 }
 
 #[cfg(test)]
 mod test {
-    use std::cell::{Cell, RefCell};
     use crate::repo_data::LazyRepoData;
-    use crate::solver::resolver::{Index, PackageVersionId, PackageVersionSet};
+    use crate::solver::resolver::Index;
     use crate::{PackageRecord, Version};
     use pubgrub::error::PubGrubError;
     use pubgrub::report::{DefaultStringReporter, Reporter};
-    use std::rc::Rc;
     use std::str::FromStr;
 
     fn conda_json_path() -> String {
@@ -530,51 +648,58 @@ mod test {
         let noarch_repo_data: LazyRepoData = serde_json::from_str(&noarch_repo_data_str).unwrap();
 
         let root_package_name = String::from("__ROOT__");
-        let version_set = Rc::new(PackageVersionSet {
-            name: root_package_name.clone(),
-            sorted: Cell::new(true),
-            variants: RefCell::new(vec![PackageRecord {
-                name: root_package_name.clone(),
-                version: Version::from_str("0").unwrap(),
-                build: "".to_string(),
-                build_number: 0,
-                subdir: "".to_string(),
-                filename: None,
-                md5: None,
-                sha256: None,
-                arch: None,
-                platform: None,
-                depends: vec![String::from("ogre")],
-                constrains: vec![],
-                track_features: vec![],
-                features: None,
-                noarch: Default::default(),
-                preferred_env: None,
-                license: None,
-                license_family: None,
-                timestamp: None,
-                date: None,
-                size: None,
-            }]),
+        let root_version = Version::from_str("0").unwrap();
+
+        let mut index = Index {
+            repo_datas: vec![noarch_repo_data, linux64_repo_data],
+            package_variants_cache: Default::default(),
+            channel_config: Default::default(),
+            match_spec_cache: Default::default(),
+        };
+
+        let root_package_variant = index.add_package(PackageRecord {
+            depends: vec![String::from("ogre")],
+            ..PackageRecord::new(
+                root_package_name.clone(),
+                root_version.clone(),
+                String::from(""),
+                0,
+            )
         });
 
-        let root_version = PackageVersionId {
-            index: 0,
-            version_set: version_set.clone(),
-        };
+        index.add_package(PackageRecord::new(
+            String::from("__linux"),
+            Version::from_str("5.10.102.1").unwrap(),
+            String::from("0"),
+            0,
+        ));
 
-        let index = Index {
-            repo_datas: vec![noarch_repo_data, linux64_repo_data],
-            cached_dependencies: Default::default(),
-            channel_config: Default::default(),
-        };
+        index.add_package(PackageRecord::new(
+            String::from("__glibc"),
+            Version::from_str("2.31").unwrap(),
+            String::from("0"),
+            0,
+        ));
 
-        index
-            .cached_dependencies
-            .borrow_mut()
-            .insert(root_package_name.clone(), version_set);
+        index.add_package(PackageRecord::new(
+            String::from("__unix"),
+            Version::from_str("0").unwrap(),
+            String::from("0"),
+            0,
+        ));
 
-        match pubgrub::solver::resolve(&index, root_package_name, root_version) {
+        index.add_package(PackageRecord::new(
+            String::from("__archspec"),
+            Version::from_str("1").unwrap(),
+            String::from("x86_64"),
+            0,
+        ));
+
+        match pubgrub::solver::resolve(
+            &index,
+            root_package_variant.name().to_owned(),
+            root_package_variant,
+        ) {
             Ok(solution) => println!("{:#?}", solution),
             Err(PubGrubError::NoSolution(mut derivation_tree)) => {
                 derivation_tree.collapse_no_versions();

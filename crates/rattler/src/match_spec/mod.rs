@@ -5,11 +5,13 @@ use std::fmt::{Debug, Display, Formatter};
 
 mod parse;
 
+pub use parse::ParseMatchSpecError;
+
 /// A `MatchSpec` is, fundamentally, a query language for conda packages. Any of the fields that
 /// comprise a [`PackageRecord`] can be used to compose a `MatchSpec`.
 #[serde_as]
 #[skip_serializing_none]
-#[derive(Debug, Default, Clone, Serialize, Eq, PartialEq)]
+#[derive(Debug, Default, Clone, Serialize, Eq, PartialEq, Hash)]
 pub struct MatchSpec {
     pub name: Option<String>,
     pub version: Option<VersionSpec>,
