@@ -52,6 +52,15 @@ impl PackageVariants {
             })
         }
     }
+
+    /// Returns the number of variants that match the given `PackageVariantSet`.
+    pub fn available_variant_count_in_range(&self, range: &PackageVariantSet) -> usize {
+        match range {
+            PackageVariantSet::Empty => 0,
+            PackageVariantSet::Full => self.variants.len(),
+            PackageVariantSet::Discrete(discrete) => discrete.included.blocks().map(|b| b.count_ones()).sum::<u32>() as usize
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -536,8 +545,19 @@ impl<'i> pubgrub::solver::DependencyProvider<String, PackageVariantSet> for Inde
         &self,
         potential_packages: impl Iterator<Item = (T, U)>,
     ) -> Result<(T, Option<VariantId>), Box<dyn Error>> {
+
+        let mut min_dependency_count = usize::MAX;
+        let mut min_package = None;
         for (package, range) in potential_packages {
             let variants = self.package_variants(package.borrow())?;
+            let count = variants.available_variant_count_in_range(range.borrow());
+            if count < min_dependency_count {
+                min_package = Some((package, variants, range));
+                min_dependency_count = count;
+            }
+        }
+
+        if let Some((package, variants, range)) = min_package {
             for &variant_idx in self.variants_order(&variants).iter() {
                 if range.borrow().contains_variant_index(variant_idx) {
                     return Ok((
@@ -550,6 +570,21 @@ impl<'i> pubgrub::solver::DependencyProvider<String, PackageVariantSet> for Inde
                 }
             }
         }
+
+        // for (package, range) in potential_packages {
+        //     let variants = self.package_variants(package.borrow())?;
+        //     for &variant_idx in self.variants_order(&variants).iter() {
+        //         if range.borrow().contains_variant_index(variant_idx) {
+        //             return Ok((
+        //                 package,
+        //                 Some(VariantId {
+        //                     version_set: variants.clone(),
+        //                     index: variant_idx,
+        //                 }),
+        //             ));
+        //         }
+        //     }
+        // }
 
         Err(anyhow::anyhow!("no packages found that can be chosen").into())
     }
@@ -658,7 +693,7 @@ mod test {
         };
 
         let root_package_variant = index.add_package(PackageRecord {
-            depends: vec![String::from("jupyterlab"), String::from("python")],
+            depends: vec![String::from("jupyterlab=3"), String::from("python")],
             ..PackageRecord::new(
                 root_package_name.clone(),
                 root_version.clone(),
