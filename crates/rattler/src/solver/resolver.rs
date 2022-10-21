@@ -658,7 +658,7 @@ mod test {
         };
 
         let root_package_variant = index.add_package(PackageRecord {
-            depends: vec![String::from("ogre")],
+            depends: vec![String::from("jupyterlab"), String::from("python")],
             ..PackageRecord::new(
                 root_package_name.clone(),
                 root_version.clone(),

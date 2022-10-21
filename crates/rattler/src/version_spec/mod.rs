@@ -231,6 +231,18 @@ mod tests {
             ))
         );
     }
+
+    #[test]
+    fn test_glob() {
+        assert_eq!(
+            VersionSpec::from_str(">2.10*"),
+            Ok(VersionSpec::Operator(
+                VersionOperator::Greater,
+                Version::from_str("2.10").unwrap()
+            ))
+        );
+    }
+
     #[test]
     fn test_group() {
         assert_eq!(
