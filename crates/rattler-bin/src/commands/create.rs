@@ -1,6 +1,7 @@
+use rattler::repo_data::OwnedLazyRepoData;
+use rattler::solver::Index;
 use rattler::{
     repo_data::fetch::{terminal_progress, MultiRequestRepoDataBuilder},
-    solver::SolverProblem,
     Channel, ChannelConfig, MatchSpec,
 };
 
@@ -44,7 +45,7 @@ pub async fn create(opt: Opt) -> anyhow::Result<()> {
         .set_listener(terminal_progress())
         .set_fail_fast(false)
         .add_channels(channels)
-        .request()
+        .request::<OwnedLazyRepoData>()
         .await;
 
     // Error out if fetching one of the sources resulted in an error.
@@ -53,16 +54,36 @@ pub async fn create(opt: Opt) -> anyhow::Result<()> {
         .map(|(channel, _, result)| result.map(|data| (channel, data)))
         .collect::<Result<Vec<_>, _>>()?;
 
-    let solver_problem = SolverProblem {
-        channels: repo_data
+    // Construct an index
+    let index = Index::new(
+        repo_data
             .iter()
-            .map(|(channel, repodata)| (channel.base_url().to_string(), repodata))
-            .collect(),
-        specs,
-    };
+            .map(|(_c, repo_data)| repo_data.repo_data()),
+        channel_config.clone(),
+    );
 
-    let result = solver_problem.solve()?;
-    println!("{:#?}", result);
+    match index.solve(specs) {
+        Err(e) => {
+            eprintln!("Failed to solve:\n{e}");
+        }
+        Ok(mut result) => {
+            result.sort_by(|a, b| a.name.cmp(&b.name));
+            for result in result {
+                eprintln!("{result}");
+            }
+        }
+    }
+
+    // let solver_problem = SolverProblem {
+    //     channels: repo_data
+    //         .iter()
+    //         .map(|(channel, repodata)| (channel.base_url().to_string(), repodata))
+    //         .collect(),
+    //     specs,
+    // };
+    //
+    // let result = solver_problem.solve()?;
+    // println!("{:#?}", result);
 
     Ok(())
 }

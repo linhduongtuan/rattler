@@ -78,7 +78,7 @@ impl FromStr for Constraint {
             }
             let (version_str, op) = if let Some(version_str) = version_str
                 .strip_suffix(".*")
-                .or_else(|| version_str.strip_suffix("*"))
+                .or_else(|| version_str.strip_suffix('*'))
             {
                 match op {
                     VersionOperator::StartsWith | VersionOperator::GreaterEquals => {

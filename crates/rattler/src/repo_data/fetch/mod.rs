@@ -9,6 +9,6 @@ mod request;
 pub use multi_request::{MultiRequestRepoDataBuilder, MultiRequestRepoDataListener};
 pub use progress::terminal_progress;
 pub use request::{
-    DoneState, DownloadingState, RepoDataRequestState, RequestRepoDataBuilder,
+    DoneState, DownloadingState, RepoDataFromBytes, RepoDataRequestState, RequestRepoDataBuilder,
     RequestRepoDataError, RequestRepoDataListener,
 };

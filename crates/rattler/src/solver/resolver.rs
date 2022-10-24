@@ -4,10 +4,14 @@ use crate::{ChannelConfig, MatchSpec, PackageRecord, Version};
 use bit_vec::BitVec;
 use itertools::Itertools;
 use once_cell::unsync::OnceCell;
+use pubgrub::error::PubGrubError;
+use pubgrub::report::{DefaultStringReporter, Reporter};
 use pubgrub::solver::{Dependencies, Requirement, RequirementKind};
 use pubgrub::type_aliases::DependencyConstraints;
 use pubgrub::version_set::VersionSet;
+use std::fmt::Write;
 use std::rc::Rc;
+use std::str::FromStr;
 use std::{
     borrow::Borrow,
     cell::RefCell,
@@ -58,7 +62,11 @@ impl PackageVariants {
         match range {
             PackageVariantSet::Empty => 0,
             PackageVariantSet::Full => self.variants.len(),
-            PackageVariantSet::Discrete(discrete) => discrete.included.blocks().map(|b| b.count_ones()).sum::<u32>() as usize
+            PackageVariantSet::Discrete(discrete) => discrete
+                .included
+                .blocks()
+                .map(|b| b.count_ones())
+                .sum::<u32>() as usize,
         }
     }
 }
@@ -288,7 +296,7 @@ impl VersionSet for PackageVariantSet {
     }
 }
 
-struct Index<'i> {
+pub struct Index<'i> {
     /// A cache of package variants
     package_variants_cache: RefCell<HashMap<String, Rc<PackageVariants>>>,
 
@@ -296,15 +304,93 @@ struct Index<'i> {
     match_spec_cache: RefCell<HashMap<MatchSpec, (Version, bool)>>,
 
     /// Repodata used by the index
-    repo_datas: Vec<LazyRepoData<'i>>,
+    repo_datas: Vec<&'i LazyRepoData<'i>>,
 
     /// Channel configuration used by the index
     channel_config: ChannelConfig,
 }
 
 impl<'i> Index<'i> {
+    /// Constructs a new index
+    pub fn new(
+        repos: impl IntoIterator<Item = &'i LazyRepoData<'i>>,
+        channel_config: ChannelConfig,
+    ) -> Self {
+        Self {
+            package_variants_cache: RefCell::new(Default::default()),
+            match_spec_cache: RefCell::new(Default::default()),
+            repo_datas: repos.into_iter().collect(),
+            channel_config,
+        }
+    }
+
+    pub fn solve(
+        &self,
+        specs: impl IntoIterator<Item = MatchSpec>,
+    ) -> Result<Vec<PackageRecord>, String> {
+        let root_package_name = String::from("__ROOT__");
+        let root_version = Version::from_str("0").unwrap();
+
+        // Create variants (just the one) for the root
+        let root_package_variant_set = Rc::new(PackageVariants {
+            name: root_package_name.clone(),
+            by_order: Default::default(),
+            dependencies: vec![OnceCell::with_value(specs.into_iter().collect())],
+            variants: vec![PackageRecord::new(
+                root_package_name,
+                root_version,
+                String::from("0"),
+                0,
+            )],
+        });
+
+        // Insert the root package name, don't care about any previous existing version
+        self.package_variants_cache.borrow_mut().insert(
+            root_package_variant_set.name.clone(),
+            root_package_variant_set.clone(),
+        );
+
+        // Construct a single version of the root package (the only one)
+        let root_package_variant = VariantId {
+            version_set: root_package_variant_set.clone(),
+            index: 0,
+        };
+
+        // Run the solver
+        match pubgrub::solver::resolve(
+            self,
+            root_package_variant.name().to_owned(),
+            root_package_variant,
+        ) {
+            Ok(solution) => Ok(solution
+                .into_values()
+                .filter(|variant_id| {
+                    !Rc::ptr_eq(&variant_id.version_set, &root_package_variant_set)
+                })
+                .map(|variant_id| variant_id.version_set.variants[variant_id.index].clone())
+                .collect()),
+            Err(PubGrubError::NoSolution(mut derivation_tree)) => {
+                derivation_tree.collapse_no_versions();
+                let mut err = String::new();
+                writeln!(
+                    &mut err,
+                    "{}",
+                    DefaultStringReporter::report(&derivation_tree)
+                )
+                .unwrap();
+                Err(err)
+            }
+            Err(err) => {
+                let mut error_message = String::new();
+                writeln!(&mut error_message, "{err:?}").unwrap();
+                Err(error_message)
+            }
+        }
+    }
+
     /// Adds a virtual package to the index
-    pub fn add_package(&mut self, package: PackageRecord) -> VariantId {
+    #[cfg(test)]
+    fn add_package(&mut self, package: PackageRecord) -> VariantId {
         let set = Rc::new(PackageVariants {
             name: package.name.clone(),
             by_order: Default::default(),
@@ -480,7 +566,7 @@ impl<'i> Index<'i> {
     }
 
     /// Returns the dependencies of a specific record of the given `PackageVariants`.
-    pub fn dependencies<'v>(
+    fn dependencies<'v>(
         &self,
         variants: &'v PackageVariants,
         variant_idx: usize,
@@ -545,7 +631,6 @@ impl<'i> pubgrub::solver::DependencyProvider<String, PackageVariantSet> for Inde
         &self,
         potential_packages: impl Iterator<Item = (T, U)>,
     ) -> Result<(T, Option<VariantId>), Box<dyn Error>> {
-
         let mut min_dependency_count = usize::MAX;
         let mut min_package = None;
         for (package, range) in potential_packages {
@@ -654,6 +739,7 @@ mod test {
     use crate::repo_data::LazyRepoData;
     use crate::solver::resolver::Index;
     use crate::{PackageRecord, Version};
+    use async_compression::Level::Default;
     use pubgrub::error::PubGrubError;
     use pubgrub::report::{DefaultStringReporter, Reporter};
     use std::str::FromStr;
@@ -682,15 +768,7 @@ mod test {
         let linux64_repo_data: LazyRepoData = serde_json::from_str(&linux64_repo_data_str).unwrap();
         let noarch_repo_data: LazyRepoData = serde_json::from_str(&noarch_repo_data_str).unwrap();
 
-        let root_package_name = String::from("__ROOT__");
-        let root_version = Version::from_str("0").unwrap();
-
-        let mut index = Index {
-            repo_datas: vec![noarch_repo_data, linux64_repo_data],
-            package_variants_cache: Default::default(),
-            channel_config: Default::default(),
-            match_spec_cache: Default::default(),
-        };
+        let mut index = Index::new(&[noarch_repo_data, linux64_repo_data], Default::default());
 
         let root_package_variant = index.add_package(PackageRecord {
             depends: vec![String::from("jupyterlab=3"), String::from("python")],

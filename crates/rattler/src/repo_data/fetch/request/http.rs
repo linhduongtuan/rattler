@@ -18,10 +18,10 @@ use tokio::io::AsyncReadExt;
 use tokio_util::io::StreamReader;
 use url::Url;
 
+use crate::repo_data::fetch::RepoDataFromBytes;
 use crate::{
     repo_data::fetch::{DoneState, DownloadingState, RepoDataRequestState, RequestRepoDataError},
     utils::{url_to_cache_filename, AsyncEncoding, Encoding},
-    RepoData,
 };
 
 /// Information stored along the repodata json that defines some caching properties.
@@ -53,12 +53,12 @@ struct RepoDataMetadata {
 /// stages. See [`RepoDataRequestState`] for the various stages a request can go through. As a
 /// downloading repodata can take several seconds the `listener` can be used to show some visual
 /// feedback to the user.
-pub async fn fetch_repodata(
+pub async fn fetch_repodata<R: RepoDataFromBytes + Send + 'static>(
     url: Url,
     client: reqwest::Client,
     cache_dir: Option<&Path>,
     listener: &mut impl FnMut(RepoDataRequestState),
-) -> Result<(RepoData, DoneState), RequestRepoDataError> {
+) -> Result<(R, DoneState), RequestRepoDataError> {
     // If a cache directory has been set for this this request try looking up a cached entry and
     // read the metadata from it. If any error occurs during the loading of the cache we simply
     // ignore it and continue without a cache.
@@ -124,10 +124,9 @@ pub async fn fetch_repodata(
         // Since repodata information can be quite huge we run the deserialization in a separate
         // background task to ensure we don't block the current thread.
         listener(RepoDataRequestState::Deserializing);
-        let repodata = tokio::task::spawn_blocking(move || {
-            serde_json::from_slice(cache_data.unwrap().as_slice())
-        })
-        .await??;
+        let repodata =
+            tokio::task::spawn_blocking(move || R::from_bytes(Bytes::from(cache_data.unwrap())))
+                .await??;
         return Ok((repodata, DoneState { cache_miss: false }));
     }
 
@@ -205,7 +204,7 @@ pub async fn fetch_repodata(
     // repodata information can be quite huge we run the deserialization in a separate background
     // task to ensure we don't block the current thread.
     listener(RepoDataRequestState::Deserializing);
-    let deserializing_future = tokio::task::spawn_blocking(move || serde_json::from_slice(&bytes))
+    let deserializing_future = tokio::task::spawn_blocking(move || R::from_bytes(bytes))
         .map_err(RequestRepoDataError::from)
         .and_then(|serde_result| async { serde_result.map_err(RequestRepoDataError::from) });
 
@@ -335,6 +334,7 @@ mod test {
     use crate::repo_data::fetch::request::REPODATA_CHANNEL_PATH;
     use crate::{
         utils::simple_channel_server::SimpleChannelServer, Channel, ChannelConfig, Platform,
+        RepoData,
     };
 
     #[tokio::test]
@@ -346,7 +346,7 @@ mod test {
         let url = server.url().to_string();
         let channel = Channel::from_str(url, &ChannelConfig::default()).unwrap();
 
-        let _result = fetch_repodata(
+        let _result = fetch_repodata::<RepoData>(
             channel
                 .platform_url(Platform::NoArch)
                 .join(REPODATA_CHANNEL_PATH)
@@ -372,7 +372,7 @@ mod test {
         let cache_dir = TempDir::new().unwrap();
 
         // Fetch the repodata from the server
-        let (repodata, done_state) = fetch_repodata(
+        let (repodata, done_state) = fetch_repodata::<RepoData>(
             channel
                 .platform_url(Platform::NoArch)
                 .join(REPODATA_CHANNEL_PATH)

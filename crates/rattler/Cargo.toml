@@ -13,6 +13,7 @@ rustls-tls = ['reqwest/rustls-tls']
 anyhow = "1.0.44"
 async-compression = {version="0.3.12", features=["gzip", "futures-bufread", "tokio", "bzip2"] }
 bytes = "1.1.0"
+ouroboros = "0.15.5"
 derive_more = "0.99.16"
 dirs = "4.0.0"
 extendhash = "1.0.9"

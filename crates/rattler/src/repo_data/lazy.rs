@@ -1,4 +1,7 @@
 use super::PackageRecord;
+use crate::repo_data::fetch::RepoDataFromBytes;
+use bytes::Bytes;
+use ouroboros::self_referencing;
 use serde::de::{Error, MapAccess};
 use serde::Deserializer;
 use std::collections::HashMap;
@@ -76,6 +79,31 @@ impl<'i, 'de: 'i> serde::Deserialize<'de> for LazyPackageRecord<'i> {
         Ok(Self {
             raw: serde::Deserialize::deserialize(deserializer)?,
         })
+    }
+}
+
+#[self_referencing]
+pub struct OwnedLazyRepoData {
+    bytes: Bytes,
+
+    #[borrows(bytes)]
+    #[covariant]
+    repo_data: LazyRepoData<'this>,
+}
+
+impl RepoDataFromBytes for OwnedLazyRepoData {
+    fn from_bytes(bytes: Bytes) -> Result<Self, serde_json::Error> {
+        OwnedLazyRepoDataTryBuilder {
+            bytes,
+            repo_data_builder: |bytes: &Bytes| serde_json::from_slice(bytes),
+        }
+        .try_build()
+    }
+}
+
+impl OwnedLazyRepoData {
+    pub fn repo_data(&self) -> &LazyRepoData {
+        self.borrow_repo_data()
     }
 }
 

@@ -1,12 +1,13 @@
 //! Defines the [`MultiRequestRepoDataBuilder`] struct. This struct enables async fetching channel
 //! repodata from multiple source in parallel.
 
+use crate::repo_data::fetch::RepoDataFromBytes;
 use crate::utils::default_cache_dir;
 use crate::{
     repo_data::fetch::request::{
         RepoDataRequestState, RequestRepoDataBuilder, RequestRepoDataError, RequestRepoDataListener,
     },
-    Channel, Platform, RepoData,
+    Channel, Platform,
 };
 use futures::{stream::FuturesUnordered, StreamExt};
 use std::path::PathBuf;
@@ -132,9 +133,9 @@ impl MultiRequestRepoDataBuilder {
     /// Asynchronously fetches repodata information from the sources added to this instance. A
     /// vector is returned that contains the state of each source. The returned state is returned in
     /// the same order as they were added.
-    pub async fn request(
+    pub async fn request<R: RepoDataFromBytes + Send + 'static>(
         mut self,
-    ) -> Vec<(Channel, Platform, Result<RepoData, RequestRepoDataError>)> {
+    ) -> Vec<(Channel, Platform, Result<R, RequestRepoDataError>)> {
         // Construct an http client for the requests if none has been specified by the user.
         let http_client = self.http_client.unwrap_or_else(reqwest::Client::new);
 

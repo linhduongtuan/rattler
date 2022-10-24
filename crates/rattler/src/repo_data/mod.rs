@@ -15,7 +15,7 @@ use crate::{NoArchType, Version};
 pub mod fetch;
 mod lazy;
 
-pub use lazy::LazyRepoData;
+pub use lazy::{LazyRepoData, OwnedLazyRepoData};
 
 /// [`RepoData`] is an index of package binaries available on in a subdirectory of a Conda channel.
 #[derive(Debug, Deserialize, Eq, PartialEq)]

@@ -1,6 +1,8 @@
 mod libsolv;
 mod resolver;
 
+pub use resolver::Index;
+
 use std::collections::HashMap;
 
 use libsolv::{Intern, Pool, Queue, Verbosity, SOLVER_INSTALL, SOLVER_SOLVABLE_PROVIDES};

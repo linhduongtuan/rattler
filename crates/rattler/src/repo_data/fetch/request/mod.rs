@@ -11,6 +11,7 @@ mod http;
 
 use crate::utils::default_cache_dir;
 use crate::{Channel, Platform, RepoData};
+use bytes::Bytes;
 use std::{io, path::PathBuf};
 use tempfile::PersistError;
 use tokio::task::JoinError;
@@ -191,7 +192,9 @@ impl RequestRepoDataBuilder {
     }
 
     /// Consumes self and starts an async request to fetch the repodata.
-    pub async fn request(self) -> Result<RepoData, RequestRepoDataError> {
+    pub async fn request<R: RepoDataFromBytes + Send + 'static>(
+        self,
+    ) -> Result<R, RequestRepoDataError> {
         // Get the url to the subdirectory index. Note that the subdirectory is the platform name.
         let platform_url = self
             .channel
@@ -247,5 +250,16 @@ impl RequestRepoDataBuilder {
                 Err(e)
             }
         }
+    }
+}
+
+pub trait RepoDataFromBytes: Sized {
+    /// Constructs an instance of `Self` from the given JSON encoded bytes.
+    fn from_bytes(bytes: Bytes) -> Result<Self, serde_json::Error>;
+}
+
+impl RepoDataFromBytes for RepoData {
+    fn from_bytes(bytes: Bytes) -> Result<Self, serde_json::Error> {
+        serde_json::from_slice(&bytes)
     }
 }
