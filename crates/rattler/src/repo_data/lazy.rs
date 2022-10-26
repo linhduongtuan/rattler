@@ -7,6 +7,8 @@ use serde::Deserializer;
 use std::collections::HashMap;
 use std::fmt;
 use std::marker::PhantomData;
+use std::path::Path;
+use thiserror::Error;
 
 #[derive(Debug)]
 pub struct LazyPackageRecord<'i> {
@@ -102,8 +104,25 @@ impl RepoDataFromBytes for OwnedLazyRepoData {
 }
 
 impl OwnedLazyRepoData {
-    pub fn repo_data(&self) -> &LazyRepoData {
+    pub fn as_ref(&self) -> &LazyRepoData {
         self.borrow_repo_data()
+    }
+}
+
+#[derive(Error, Debug)]
+pub enum OwnedLazyRepoDataFromFileError {
+    #[error("error deserializing")]
+    Deserialize(#[from] serde_json::Error),
+    #[error("error reading file")]
+    IoError(#[from] std::io::Error),
+}
+
+impl OwnedLazyRepoData {
+    /// Constructs an new instance directory from a file path.
+    pub fn from_file(
+        path: impl AsRef<Path>,
+    ) -> Result<OwnedLazyRepoData, OwnedLazyRepoDataFromFileError> {
+        Ok(Self::from_bytes(Bytes::from(std::fs::read(path)?))?)
     }
 }
 

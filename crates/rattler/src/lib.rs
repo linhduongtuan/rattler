@@ -24,6 +24,7 @@ pub mod solver;
 pub(crate) mod utils;
 mod version;
 mod version_spec;
+mod virtual_packages;
 
 pub use channel::{Channel, ChannelConfig, ParseChannelError};
 pub use channel_data::{ChannelData, ChannelDataPackage};

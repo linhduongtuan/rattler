@@ -56,9 +56,7 @@ pub async fn create(opt: Opt) -> anyhow::Result<()> {
 
     // Construct an index
     let index = Index::new(
-        repo_data
-            .iter()
-            .map(|(_c, repo_data)| repo_data.repo_data()),
+        repo_data.iter().map(|(_c, repo_data)| repo_data.as_ref()),
         channel_config.clone(),
     );
 

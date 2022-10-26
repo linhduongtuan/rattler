@@ -307,7 +307,7 @@ pub struct Index<'i> {
     repo_datas: Vec<&'i LazyRepoData<'i>>,
 
     /// Channel configuration used by the index
-    channel_config: ChannelConfig,
+    pub channel_config: ChannelConfig,
 }
 
 impl<'i> Index<'i> {
@@ -736,118 +736,74 @@ impl<'i> pubgrub::solver::DependencyProvider<String, PackageVariantSet> for Inde
 
 #[cfg(test)]
 mod test {
-    use crate::repo_data::LazyRepoData;
+    use crate::repo_data::OwnedLazyRepoData;
     use crate::solver::resolver::Index;
-    use crate::{PackageRecord, Version};
-    use async_compression::Level::Default;
-    use pubgrub::error::PubGrubError;
-    use pubgrub::report::{DefaultStringReporter, Reporter};
-    use std::str::FromStr;
+    use crate::{MatchSpec, Platform};
+    use insta::assert_yaml_snapshot;
+    use itertools::Itertools;
+    use once_cell::sync::Lazy;
+    use std::path::PathBuf;
 
-    fn conda_json_path() -> String {
+    /// Returns the path to the conda-forge repodata stored in the repository.
+    fn conda_forge_repo_data_path(arch: Platform) -> PathBuf {
         format!(
-            "{}/{}",
+            "{}/resources/channels/conda-forge/{}/repodata.json",
             env!("CARGO_MANIFEST_DIR"),
-            "resources/channels/conda-forge/linux-64/repodata.json"
+            arch
         )
+        .into()
     }
 
-    fn conda_json_path_noarch() -> String {
-        format!(
-            "{}/{}",
-            env!("CARGO_MANIFEST_DIR"),
-            "resources/channels/conda-forge/noarch/repodata.json"
-        )
+    fn conda_forge_repo_data_linux_64() -> &'static OwnedLazyRepoData {
+        static LINUX64_REPODATA: Lazy<OwnedLazyRepoData> = Lazy::new(|| {
+            OwnedLazyRepoData::from_file(conda_forge_repo_data_path(Platform::Linux64))
+                .expect("failed to read linux-64 conda-forge repodata")
+        });
+        &*LINUX64_REPODATA
+    }
+
+    fn conda_forge_repo_data_noarch() -> &'static OwnedLazyRepoData {
+        static NOARCH_REPODATA: Lazy<OwnedLazyRepoData> = Lazy::new(|| {
+            OwnedLazyRepoData::from_file(conda_forge_repo_data_path(Platform::NoArch))
+                .expect("failed to read noarch conda-forge repodata")
+        });
+        &*NOARCH_REPODATA
+    }
+
+    fn solve(specs: impl IntoIterator<Item = impl AsRef<str>>) -> Result<Vec<String>, String> {
+        let channel_config = Default::default();
+
+        // Parse the specs
+        let specs: Vec<_> = specs
+            .into_iter()
+            .map(|spec| MatchSpec::from_str(spec.as_ref(), &channel_config).unwrap())
+            .collect();
+
+        // Create the index
+        let index = Index::new(
+            [
+                conda_forge_repo_data_linux_64().as_ref(),
+                conda_forge_repo_data_noarch().as_ref(),
+            ],
+            channel_config,
+        );
+
+        // Call the solver
+        index
+            .solve(specs)
+            .map(|result| result.iter().map(ToString::to_string).sorted().collect())
     }
 
     #[test]
-    pub fn resolve_python() {
-        let linux64_repo_data_str = std::fs::read_to_string(conda_json_path()).unwrap();
-        let noarch_repo_data_str = std::fs::read_to_string(conda_json_path_noarch()).unwrap();
+    pub fn solve_python() {
+        assert_yaml_snapshot!(solve(["python"]));
+    }
 
-        let linux64_repo_data: LazyRepoData = serde_json::from_str(&linux64_repo_data_str).unwrap();
-        let noarch_repo_data: LazyRepoData = serde_json::from_str(&noarch_repo_data_str).unwrap();
-
-        let mut index = Index::new(&[noarch_repo_data, linux64_repo_data], Default::default());
-
-        let root_package_variant = index.add_package(PackageRecord {
-            depends: vec![String::from("jupyterlab=3"), String::from("python")],
-            ..PackageRecord::new(
-                root_package_name.clone(),
-                root_version.clone(),
-                String::from(""),
-                0,
-            )
-        });
-
-        index.add_package(PackageRecord::new(
-            String::from("__linux"),
-            Version::from_str("5.10.102.1").unwrap(),
-            String::from("0"),
-            0,
-        ));
-
-        index.add_package(PackageRecord::new(
-            String::from("__glibc"),
-            Version::from_str("2.31").unwrap(),
-            String::from("0"),
-            0,
-        ));
-
-        index.add_package(PackageRecord::new(
-            String::from("__unix"),
-            Version::from_str("0").unwrap(),
-            String::from("0"),
-            0,
-        ));
-
-        index.add_package(PackageRecord::new(
-            String::from("__archspec"),
-            Version::from_str("1").unwrap(),
-            String::from("x86_64"),
-            0,
-        ));
-
-        match pubgrub::solver::resolve(
-            &index,
-            root_package_variant.name().to_owned(),
-            root_package_variant,
-        ) {
-            Ok(solution) => println!("{:#?}", solution),
-            Err(PubGrubError::NoSolution(mut derivation_tree)) => {
-                derivation_tree.collapse_no_versions();
-                eprintln!("{}", DefaultStringReporter::report(&derivation_tree));
-            }
-            Err(err) => panic!("{:?}", err),
-        };
-
-        panic!("err");
-
-        // "__ROOT__": __ROOT__=0=,
-        // "_libgcc_mutex": _libgcc_mutex=0.1=conda_forge,
-        // "_openmp_mutex": _openmp_mutex=4.5=2_gnu,
-        // "bzip2": bzip2=1.0.8=h7f98852_4,
-        // "c-ares": c-ares=1.18.1=h7f98852_0,
-        // "ca-certificates": ca-certificates=2022.9.24=ha878542_0,
-        // "cmake": cmake=3.24.2=h5432695_0,
-        // "expat": expat=2.4.9=h27087fc_0,
-        // "keyutils": keyutils=1.6.1=h166bdaf_0,
-        // "krb5": krb5=1.19.3=h08a2579_0,
-        // "libcurl": libcurl=7.85.0=h2283fc2_0,
-        // "libedit": libedit=3.1.20191231=he28a2e2_2,
-        // "libev": libev=4.33=h516909a_1,
-        // "libgcc-ng": libgcc-ng=12.2.0=h65d4601_18,
-        // "libgomp": libgomp=12.2.0=h65d4601_18,
-        // "libnghttp2": libnghttp2=1.47.0=hff17c54_1,
-        // "libssh2": libssh2=1.10.0=hf14f497_3,
-        // "libstdcxx-ng": libstdcxx-ng=12.2.0=h46fd767_18,
-        // "libuv": libuv=1.44.2=h166bdaf_0,
-        // "libzlib": libzlib=1.2.13=h166bdaf_4,
-        // "ncurses": ncurses=6.3=h27087fc_1,
-        // "openssl": openssl=3.0.5=h166bdaf_2,
-        // "rhash": rhash=1.4.3=h166bdaf_0,
-        // "xz": xz=5.2.6=h166bdaf_0,
-        // "zlib": zlib=1.2.13=h166bdaf_4,
-        // "zstd": zstd=1.5.2=h6239696_4,
+    #[test]
+    pub fn order_doesnt_matter() {
+        assert_eq!(
+            solve(["python", "jupyterlab"]),
+            solve(["jupyterlab", "python"])
+        )
     }
 }
