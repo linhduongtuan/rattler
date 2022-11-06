@@ -744,7 +744,6 @@ mod test {
     use once_cell::sync::Lazy;
     use std::path::PathBuf;
 
-    /// Returns the path to the conda-forge repodata stored in the repository.
     fn conda_forge_repo_data_path(arch: Platform) -> PathBuf {
         format!(
             "{}/resources/channels/conda-forge/{}/repodata.json",
