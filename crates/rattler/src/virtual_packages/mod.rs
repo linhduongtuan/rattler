@@ -1,17 +1,29 @@
 mod cuda;
 
-#[cfg(unix)]
-mod libc;
+cfg_if! {
+    if #[cfg(target_os = "linux")] {
+        mod linux;
+        pub use self::linux::DETECTED_LINUX_VERSION;
+    } else {
+        pub static DETECTED_LINUX_VERSION: Lazy<Option<Version>> = Lazy::new(|| None);
+    }
+}
 
-#[cfg(target_os = "linux")]
-mod linux;
+cfg_if! {
+    if #[cfg(unix)] {
+        mod libc;
+        pub use self::libc::DETECTED_LIBC_VERSION;
+    } else {
+        pub static DETECTED_LIBC_VERSION: Lazy<Option<(String, Version)>> = Lazy::new(|| None);
+    }
+}
 
 pub use self::cuda::DETECTED_CUDA_VERSION;
-pub use self::libc::DETECTED_LIBC_VERSION;
-pub use self::linux::DETECTED_LINUX_VERSION;
+
 use crate::{PackageRecord, Version};
 use once_cell::sync::Lazy;
 use std::str::FromStr;
+use cfg_if::cfg_if;
 
 #[derive(Clone, Eq, PartialEq)]
 pub enum VirtualPackage {
