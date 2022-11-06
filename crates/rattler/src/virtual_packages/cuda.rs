@@ -1,16 +1,20 @@
 use crate::Version;
 use libloading::Symbol;
+use once_cell::sync::Lazy;
 use std::{
-    os::raw::{c_int, c_uint, c_ulong},
     mem::MaybeUninit,
-    str::FromStr
+    os::raw::{c_int, c_uint, c_ulong},
+    str::FromStr,
 };
+
+/// Memoized CUDA version
+pub static DETECTED_CUDA_VERSION: Lazy<Option<Version>> = Lazy::new(detect_cuda_version);
 
 /// Attempts to detect the version of CUDA present in the current operating system.
 pub fn detect_cuda_version() -> Option<Version> {
     // Try to open the library
     let cuda_library = cuda_library_paths()
-        .into_iter()
+        .iter()
         .find_map(|path| unsafe { libloading::Library::new(*path).ok() })?;
 
     // Get entry points from the library
@@ -26,7 +30,7 @@ pub fn detect_cuda_version() -> Option<Version> {
 
     // Get the version from the library
     let mut version_int = MaybeUninit::uninit();
-    if unsafe { cu_driver_get_version( version_int.as_mut_ptr() ) != 0 } {
+    if unsafe { cu_driver_get_version(version_int.as_mut_ptr()) != 0 } {
         return None;
     }
     let version = unsafe { version_int.assume_init() };
@@ -54,6 +58,7 @@ fn cuda_library_paths() -> &'static [&'static str] {
         "libcuda.so",                           // Check library path first
         "/usr/lib64/nvidia/libcuda.so",         // RHEL/Centos/Fedora
         "/usr/lib/x86_64-linux-gnu/libcuda.so", // Ubuntu
+        "/usr/lib/wsl/lib/libcuda.so",          // WSL (workaround)
     ];
     #[cfg(windows)]
     static FILENAMES: &[&str] = &["nvcuda.dll"];

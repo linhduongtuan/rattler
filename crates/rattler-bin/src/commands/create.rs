@@ -2,6 +2,7 @@ use rattler::repo_data::OwnedLazyRepoData;
 use rattler::solver::Index;
 use rattler::{
     repo_data::fetch::{terminal_progress, MultiRequestRepoDataBuilder},
+    virtual_packages::DETECTED_VIRTUAL_PACKAGES,
     Channel, ChannelConfig, MatchSpec,
 };
 
@@ -55,10 +56,17 @@ pub async fn create(opt: Opt) -> anyhow::Result<()> {
         .collect::<Result<Vec<_>, _>>()?;
 
     // Construct an index
-    let index = Index::new(
-        repo_data.iter().map(|(_c, repo_data)| repo_data.as_ref()),
+    let mut index = Index::new(
+        repo_data
+            .iter()
+            .map(|(_c, repo_data)| repo_data.repo_data()),
         channel_config.clone(),
     );
+
+    // Add virtual packages
+    for package in DETECTED_VIRTUAL_PACKAGES.iter() {
+        index.add_package(package.clone().into());
+    }
 
     match index.solve(specs) {
         Err(e) => {

@@ -6,7 +6,7 @@ use itertools::Itertools;
 use once_cell::unsync::OnceCell;
 use pubgrub::error::PubGrubError;
 use pubgrub::report::{DefaultStringReporter, Reporter};
-use pubgrub::solver::{Dependencies, Requirement, RequirementKind};
+use pubgrub::solver::{Dependencies, Requirement};
 use pubgrub::type_aliases::DependencyConstraints;
 use pubgrub::version_set::VersionSet;
 use std::fmt::Write;
@@ -72,7 +72,7 @@ impl PackageVariants {
 }
 
 #[derive(Clone)]
-struct VariantId {
+pub struct VariantId {
     version_set: Rc<PackageVariants>,
     index: usize,
 }
@@ -103,6 +103,7 @@ impl PartialEq for VariantId {
         self.index == other.index
     }
 }
+
 impl Eq for VariantId {}
 
 impl PartialOrd for VariantId {
@@ -389,8 +390,7 @@ impl<'i> Index<'i> {
     }
 
     /// Adds a virtual package to the index
-    #[cfg(test)]
-    fn add_package(&mut self, package: PackageRecord) -> VariantId {
+    pub fn add_package(&mut self, package: PackageRecord) -> VariantId {
         let set = Rc::new(PackageVariants {
             name: package.name.clone(),
             by_order: Default::default(),
@@ -698,10 +698,12 @@ impl<'i> pubgrub::solver::DependencyProvider<String, PackageVariantSet> for Inde
 
             result
                 .entry(name.clone())
-                .and_modify(|spec| {
-                    spec.range = spec.range.intersection(&range);
+                .and_modify(|spec| match spec {
+                    Requirement::Required(spec_range) | Requirement::Constrained(spec_range) => {
+                        *spec_range = spec_range.intersection(&range)
+                    }
                 })
-                .or_insert_with(|| Requirement::from_constraint(range));
+                .or_insert_with(|| Requirement::Constrained(range));
         }
 
         for match_spec in dependencies {
@@ -724,10 +726,12 @@ impl<'i> pubgrub::solver::DependencyProvider<String, PackageVariantSet> for Inde
             result
                 .entry(name.clone())
                 .and_modify(|spec| {
-                    spec.range = spec.range.intersection(&range);
-                    spec.kind = RequirementKind::Required;
+                    *spec = Requirement::Required(match spec {
+                        Requirement::Required(spec_range)
+                        | Requirement::Constrained(spec_range) => spec_range.intersection(&range),
+                    });
                 })
-                .or_insert_with(|| Requirement::from_dependency(range));
+                .or_insert_with(|| Requirement::Required(range));
         }
 
         Ok(Dependencies::Known(result))
@@ -781,8 +785,8 @@ mod test {
         // Create the index
         let index = Index::new(
             [
-                conda_forge_repo_data_linux_64().as_ref(),
-                conda_forge_repo_data_noarch().as_ref(),
+                conda_forge_repo_data_linux_64().repo_data(),
+                conda_forge_repo_data_noarch().repo_data(),
             ],
             channel_config,
         );

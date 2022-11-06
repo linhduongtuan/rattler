@@ -2,12 +2,11 @@ use super::PackageRecord;
 use crate::repo_data::fetch::RepoDataFromBytes;
 use bytes::Bytes;
 use ouroboros::self_referencing;
-use serde::de::{Error, MapAccess};
-use serde::Deserializer;
-use std::collections::HashMap;
-use std::fmt;
-use std::marker::PhantomData;
-use std::path::Path;
+use serde::{
+    de::{Error, MapAccess},
+    Deserializer,
+};
+use std::{collections::HashMap, fmt, marker::PhantomData, path::Path};
 use thiserror::Error;
 
 #[derive(Debug)]
@@ -104,7 +103,7 @@ impl RepoDataFromBytes for OwnedLazyRepoData {
 }
 
 impl OwnedLazyRepoData {
-    pub fn as_ref(&self) -> &LazyRepoData {
+    pub fn repo_data(&self) -> &LazyRepoData {
         self.borrow_repo_data()
     }
 }
