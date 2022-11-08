@@ -311,8 +311,28 @@ fn parse(input: &str, channel_config: &ChannelConfig) -> Result<MatchSpec, Parse
 
         let (version_str, build_str) = split_version_and_build(input)?;
 
-        let version_str = if version_str.find(char::is_whitespace).is_some() {
-            Cow::Owned(version_str.replace(char::is_whitespace, ""))
+        // let version_str = if version_str.find(char::is_whitespace).is_some() {
+        //     Cow::Owned(version_str.replace(char::is_whitespace, ""))
+        // } else {
+        //     Cow::Borrowed(version_str)
+        // };
+
+        // translate version '=1.2.3' to '1.2.3*' if it a simple version starting with '='? i.e.
+        // '=1.2.3'
+        let version_str = if version_str == "==" {
+            Cow::Borrowed(version_str)
+        } else if let Some(version_rest) = version_str.strip_prefix("=") {
+            if version_str.starts_with("==") && build_str.is_none() {
+                Cow::Borrowed(&version_str[2..])
+            } else if !version_rest.contains(['=', ',', '|']) {
+                if build_str.is_none() && !version_str.ends_with("*") {
+                    Cow::Owned(format!("{}*", version_rest))
+                } else {
+                    Cow::Borrowed(version_rest)
+                }
+            } else {
+                Cow::Borrowed(version_str)
+            }
         } else {
             Cow::Borrowed(version_str)
         };
@@ -408,6 +428,8 @@ mod tests {
             MatchSpec::from_str("python 3.8.* *_cpython", &channel_config).unwrap(),
             MatchSpec::from_str("foo=1.0=py27_0", &channel_config).unwrap(),
             MatchSpec::from_str("foo==1.0=py27_0", &channel_config).unwrap(),
+            MatchSpec::from_str("faiss-proc =*=cuda", &channel_config).unwrap(),
+            MatchSpec::from_str("faiss-cpu ==9999999999", &channel_config).unwrap()
         ],
         @r###"
         ---
@@ -415,11 +437,16 @@ mod tests {
           version: 3.8.*
           build: "*_cpython"
         - name: foo
-          version: 1.0.*
+          version: "==1.0"
           build: py27_0
         - name: foo
           version: "==1.0"
           build: py27_0
+        - name: faiss-proc
+          version: "*"
+          build: cuda
+        - name: faiss-cpu
+          version: "==9999999999"
         "###);
     }
 }
