@@ -274,7 +274,7 @@ fn parse_scheme(channel: &str) -> Option<&str> {
 
 /// Returns true if the specified string is considered to be a path
 fn is_path(path: &str) -> bool {
-    regex!(r"(\./|\.\.|~|/|[a-zA-Z]:[/\\]|\\\\|//)").is_match(path)
+    regex!(r"^(\./|\.\.|~|/|[a-zA-Z]:[/\\]|\\\\|//)").is_match(path)
 }
 
 /// Normalizes a file path by eliminating `..` and `.`.
@@ -419,6 +419,19 @@ mod tests {
         assert_eq!(channel.platforms, None);
 
         assert_eq!(channel, Channel::from_name("conda-forge/", None, &config));
+    }
+
+    #[test]
+    fn parse_by_name_with_slash() {
+        let config = ChannelConfig::default();
+
+        let channel = Channel::from_str("pkgs/main", &config).unwrap();
+        assert_eq!(
+            channel.base_url,
+            Url::from_str("https://conda.anaconda.org/pkgs/main/").unwrap()
+        );
+        assert_eq!(channel.name.as_deref(), Some("pkgs/main"));
+        assert_eq!(channel.platforms, None);
     }
 
     #[test]
