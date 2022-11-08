@@ -318,11 +318,13 @@ fn absolute_path(path: &Path) -> Cow<'_, Path> {
 
 #[cfg(test)]
 mod tests {
-    use crate::channel::{absolute_path, normalize_path, parse_platforms};
+    use crate::channel::{absolute_path, is_path, normalize_path, parse_platforms};
     use crate::{ParseChannelError, ParsePlatformError};
     use smallvec::smallvec;
     use std::path::{Path, PathBuf};
     use std::str::FromStr;
+    use regex::internal::Input;
+    use tokio::io::AsyncBufReadExt;
     use url::Url;
 
     use super::{parse_scheme, Channel, ChannelConfig, Platform};
@@ -346,6 +348,15 @@ mod tests {
             parse_platforms("[notaplatform]"),
             Err(ParsePlatformError { .. })
         ));
+    }
+
+    #[test]
+    fn test_is_path() {
+        assert!(is_path("./foo"));
+        assert!(is_path("../foo"));
+        assert!(is_path("~/foo"));
+        assert!(is_path("/foo"));
+        assert!(!is_path("foo/bar"));
     }
 
     #[test]
