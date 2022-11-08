@@ -41,8 +41,7 @@ tokio-tar = { version="0.3.0", git="https://github.com/baszalmstra/tokio-tar", b
 tokio-util = { version = "0.7.3", features = ["codec", "io"] }
 tracing = "0.1.29"
 url = { version = "2.2.2", features = ["serde"] }
-
-pubgrub = { git="https://github.com/baszalmstra/pubgrub.git", branch="feat/constrains" }
+pubgrub = { git="https://github.com/baszalmstra/pubgrub.git", rev="21380ca7d6d456fec989e98de033258c336bbec8" }
 bit-vec = "0.6.3"
 glob = "0.3.0"
 

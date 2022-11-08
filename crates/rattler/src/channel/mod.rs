@@ -323,8 +323,6 @@ mod tests {
     use smallvec::smallvec;
     use std::path::{Path, PathBuf};
     use std::str::FromStr;
-    use regex::internal::Input;
-    use tokio::io::AsyncBufReadExt;
     use url::Url;
 
     use super::{parse_scheme, Channel, ChannelConfig, Platform};

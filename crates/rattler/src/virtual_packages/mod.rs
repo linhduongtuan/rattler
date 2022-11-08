@@ -21,9 +21,9 @@ cfg_if! {
 pub use self::cuda::DETECTED_CUDA_VERSION;
 
 use crate::{PackageRecord, Version};
+use cfg_if::cfg_if;
 use once_cell::sync::Lazy;
 use std::str::FromStr;
-use cfg_if::cfg_if;
 
 #[derive(Clone, Eq, PartialEq)]
 pub enum VirtualPackage {
