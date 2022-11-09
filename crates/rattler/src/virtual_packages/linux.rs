@@ -1,7 +1,6 @@
 use crate::{ParseVersionError, Version};
 use once_cell::sync::Lazy;
 use std::{ffi::CStr, mem::MaybeUninit, str::FromStr};
-use tracing::log;
 
 mod ffi {
     use std::os::raw::{c_char, c_int};
@@ -40,7 +39,7 @@ pub fn detect_linux_version() -> Option<Version> {
     match parse_linux_version(release_str.as_ref()) {
         Ok(version) => Some(version),
         Err(e) => {
-            log::warn!(
+            tracing::warn!(
                 "unable to parse linux release version '{}': {e}",
                 release_str.as_ref()
             );

@@ -1,7 +1,8 @@
 use clap::Parser;
 use tracing_subscriber::filter::LevelFilter;
+use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
-use tracing_subscriber::EnvFilter;
+use tracing_subscriber::{fmt, EnvFilter};
 
 mod commands;
 
@@ -35,17 +36,16 @@ async fn main() -> anyhow::Result<()> {
     let default_filter = opt
         .verbose
         .then_some(LevelFilter::DEBUG)
-        .unwrap_or(LevelFilter::INFO);
+        .unwrap_or(LevelFilter::WARN);
+
     let env_filter = EnvFilter::builder()
         .with_default_directive(default_filter.into())
         .from_env()?;
 
-    // Setup the tracing subscriber
-    tracing_subscriber::fmt()
-        .with_env_filter(env_filter)
-        .without_time()
-        .finish()
-        .try_init()?;
+    tracing_subscriber::registry()
+        .with(fmt::layer())
+        .with(env_filter)
+        .init();
 
     // Dispatch the selected comment
     match opt.command {

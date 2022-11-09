@@ -186,7 +186,9 @@ impl Channel {
 
     /// Returns the canonical name of the channel
     pub fn canonical_name(&self) -> String {
-        self.base_url.to_string()
+        self.name
+            .clone()
+            .unwrap_or_else(|| self.base_url.to_string())
     }
 }
 

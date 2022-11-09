@@ -1,5 +1,5 @@
 use crate::match_spec::ParseMatchSpecError;
-use crate::repo_data::LazyRepoData;
+use crate::repo_data::{LazyRepoData, OwnedLazyRepoData};
 use crate::{ChannelConfig, MatchSpec, PackageRecord, Version};
 use bit_vec::BitVec;
 use itertools::Itertools;
@@ -23,6 +23,30 @@ use std::{
 
 const ROOT_NAME: &str = "__ROOT__";
 
+/// A trait that provides the solver with packages
+pub trait PackageRecordProvider {
+    /// Returns all records for the package with the given name.
+    fn records(&self, package: &str) -> Result<Vec<PackageRecord>, Box<dyn Error>>;
+}
+
+impl<'input, 'repo: 'input> PackageRecordProvider for &'repo LazyRepoData<'input> {
+    fn records(&self, package: &str) -> Result<Vec<PackageRecord>, Box<dyn Error>> {
+        self.packages
+            .get(package)
+            .map(IntoIterator::into_iter)
+            .into_iter()
+            .flatten()
+            .map(|record| record.parse().map_err(Into::into))
+            .collect()
+    }
+}
+
+impl PackageRecordProvider for OwnedLazyRepoData {
+    fn records(&self, package: &str) -> Result<Vec<PackageRecord>, Box<dyn Error>> {
+        self.repo_data().records(package)
+    }
+}
+
 /// A complete set of all versions and variants of a single package.
 ///
 /// A package in Conda has one or more entries these entries. Each entry of a single package is
@@ -40,8 +64,8 @@ const ROOT_NAME: &str = "__ROOT__";
 struct PackageVariants {
     name: String,
 
-    /// A list of all records
-    variants: Vec<PackageRecord>,
+    /// A list of all records and the corresponding source index.
+    variants: Vec<(usize, PackageRecord)>,
 
     /// The order of variants when sorted according to resolver rules
     solver_order: OnceCell<Vec<usize>>,
@@ -55,7 +79,7 @@ impl PackageVariants {
     pub fn subset_from_matchspec(self: Rc<Self>, match_spec: &MatchSpec) -> PackageVariantsSubset {
         // Construct a bitset that includes
         let mut included = BitVec::from_elem(self.variants.len(), false);
-        for (idx, variant) in self.variants.iter().enumerate() {
+        for (idx, (_, variant)) in self.variants.iter().enumerate() {
             if match_spec.matches(variant) {
                 included.set(idx, true)
             }
@@ -89,7 +113,7 @@ impl PackageVariants {
 
 /// Represents a single variant within a `PackageVariants`.
 #[derive(Clone)]
-pub struct PackageVariantId {
+struct PackageVariantId {
     version_set: Rc<PackageVariants>,
     index: usize,
 }
@@ -109,7 +133,7 @@ impl Debug for PackageVariantId {
 
 impl Display for PackageVariantId {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        let variant = &self.version_set.variants[self.index];
+        let (_, variant) = &self.version_set.variants[self.index];
         if variant.name == ROOT_NAME {
             write!(f, "the environment")
         } else {
@@ -336,7 +360,7 @@ impl VersionSet for PackageVariantsSubset {
     }
 }
 
-pub struct Index<'i> {
+pub struct Index<C: Clone, P: PackageRecordProvider> {
     /// A cache of package variants
     package_variants_cache: RefCell<HashMap<String, Rc<PackageVariants>>>,
 
@@ -344,18 +368,15 @@ pub struct Index<'i> {
     match_spec_cache: RefCell<HashMap<MatchSpec, (Version, bool)>>,
 
     /// Repodata used by the index
-    repo_datas: Vec<&'i LazyRepoData<'i>>,
+    repo_datas: Vec<(C, P)>,
 
     /// Channel configuration used by the index
     pub channel_config: ChannelConfig,
 }
 
-impl<'i> Index<'i> {
+impl<C: Clone, P: PackageRecordProvider> Index<C, P> {
     /// Constructs a new index
-    pub fn new(
-        repos: impl IntoIterator<Item = &'i LazyRepoData<'i>>,
-        channel_config: ChannelConfig,
-    ) -> Self {
+    pub fn new(repos: impl IntoIterator<Item = (C, P)>, channel_config: ChannelConfig) -> Self {
         Self {
             package_variants_cache: RefCell::new(Default::default()),
             match_spec_cache: RefCell::new(Default::default()),
@@ -367,7 +388,7 @@ impl<'i> Index<'i> {
     pub fn solve(
         &self,
         specs: impl IntoIterator<Item = MatchSpec>,
-    ) -> Result<Vec<PackageRecord>, String> {
+    ) -> Result<Vec<(C, PackageRecord)>, String> {
         let root_package_name = ROOT_NAME.to_owned();
         let root_version = Version::from_str("0").unwrap();
 
@@ -376,11 +397,9 @@ impl<'i> Index<'i> {
             name: root_package_name.clone(),
             solver_order: Default::default(),
             dependencies: vec![OnceCell::with_value(specs.into_iter().collect())],
-            variants: vec![PackageRecord::new(
-                root_package_name,
-                root_version,
-                String::from("0"),
+            variants: vec![(
                 0,
+                PackageRecord::new(root_package_name, root_version, String::from("0"), 0),
             )],
         });
 
@@ -408,6 +427,9 @@ impl<'i> Index<'i> {
                     !Rc::ptr_eq(&variant_id.version_set, &root_package_variant_set)
                 })
                 .map(|variant_id| variant_id.version_set.variants[variant_id.index].clone())
+                .filter_map(|(c, record)| {
+                    (c > 0).then(|| (self.repo_datas[c - 1].0.clone(), record))
+                })
                 .collect()),
             Err(PubGrubError::NoSolution(mut derivation_tree)) => {
                 derivation_tree.collapse_no_versions();
@@ -429,12 +451,12 @@ impl<'i> Index<'i> {
     }
 
     /// Adds a virtual package to the index
-    pub fn add_package(&mut self, package: PackageRecord) -> PackageVariantId {
+    pub fn add_virtual_package(&mut self, package: PackageRecord) {
         let set = Rc::new(PackageVariants {
             name: package.name.clone(),
             solver_order: Default::default(),
             dependencies: vec![Default::default()],
-            variants: vec![package],
+            variants: vec![(0, package)],
         });
 
         if let Some(previous_package) = self
@@ -443,11 +465,6 @@ impl<'i> Index<'i> {
             .insert(set.name.clone(), set.clone())
         {
             panic!("duplicate package entry for `{}`", previous_package.name);
-        }
-
-        PackageVariantId {
-            version_set: set,
-            index: 0,
         }
     }
 
@@ -460,19 +477,19 @@ impl<'i> Index<'i> {
             result
         } else {
             drop(borrow);
-            let variants = self
+            let variants: Vec<(usize, PackageRecord)> = self
                 .repo_datas
                 .iter()
-                .flat_map(|repodata| {
+                .enumerate()
+                .map(|(index, (_, repodata))| {
                     repodata
-                        .packages
-                        .get(package)
-                        .map(IntoIterator::into_iter)
-                        .into_iter()
-                        .flatten()
-                        .map(|record| record.parse())
+                        .records(package)
+                        .map(|records| records.into_iter().map(move |record| (index + 1, record)))
                 })
-                .collect::<Result<Vec<_>, _>>()?;
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter()
+                .flatten()
+                .collect();
 
             let set = Rc::new(PackageVariants {
                 name: package.clone(),
@@ -509,8 +526,8 @@ impl<'i> Index<'i> {
 
     /// Returns the order of two package variants based on rules used by conda.
     fn compare_variants(&self, variants: &PackageVariants, a_idx: usize, b_idx: usize) -> Ordering {
-        let a = &variants.variants[a_idx];
-        let b = &variants.variants[b_idx];
+        let (_, a) = &variants.variants[a_idx];
+        let (_, b) = &variants.variants[b_idx];
 
         // First compare by "tracked_features". If one of the packages has a tracked feature it is
         // sorted below the one that doesnt have the tracked feature.
@@ -611,7 +628,7 @@ impl<'i> Index<'i> {
         variant_idx: usize,
     ) -> Result<&'v Vec<MatchSpec>, ParseMatchSpecError> {
         variants.dependencies[variant_idx].get_or_try_init(|| {
-            let record = &variants.variants[variant_idx];
+            let (_, record) = &variants.variants[variant_idx];
             record
                 .depends
                 .iter()
@@ -638,11 +655,11 @@ impl<'i> Index<'i> {
         let matching_records = version_set
             .variants
             .iter()
-            .filter(|&record| match_spec.matches(record));
+            .filter(|&(_, record)| match_spec.matches(record));
 
         // Determine the highest version as well as the whether all matching records have tracked
         // features.
-        let result: Option<(Version, bool)> = matching_records.fold(None, |init, record| {
+        let result: Option<(Version, bool)> = matching_records.fold(None, |init, (_, record)| {
             Some(init.map_or_else(
                 || (record.version.clone(), !record.track_features.is_empty()),
                 |(version, has_tracked_features)| {
@@ -665,7 +682,9 @@ impl<'i> Index<'i> {
     }
 }
 
-impl<'i> pubgrub::solver::DependencyProvider<String, PackageVariantsSubset> for Index<'i> {
+impl<C: Clone, P: PackageRecordProvider>
+    pubgrub::solver::DependencyProvider<String, PackageVariantsSubset> for Index<C, P>
+{
     fn choose_package_version<T: Borrow<String>, U: Borrow<PackageVariantsSubset>>(
         &self,
         potential_packages: impl Iterator<Item = (T, U)>,
@@ -727,7 +746,7 @@ impl<'i> pubgrub::solver::DependencyProvider<String, PackageVariantsSubset> for 
         version: &PackageVariantId,
     ) -> Result<Dependencies<String, PackageVariantsSubset>, Box<dyn Error>> {
         debug_assert!(package == &version.version_set.name);
-        let record = &version.version_set.variants[version.index];
+        let (_, record) = &version.version_set.variants[version.index];
         let dependencies = self.dependencies(&version.version_set, version.index)?;
 
         let mut result: DependencyConstraints<String, Requirement<PackageVariantsSubset>> =
@@ -846,16 +865,20 @@ mod test {
         // Create the index
         let index = Index::new(
             [
-                conda_forge_repo_data_linux_64().repo_data(),
-                conda_forge_repo_data_noarch().repo_data(),
+                (0, conda_forge_repo_data_linux_64().repo_data()),
+                (1, conda_forge_repo_data_noarch().repo_data()),
             ],
             channel_config,
         );
 
         // Call the solver
-        index
-            .solve(specs)
-            .map(|result| result.iter().map(ToString::to_string).sorted().collect())
+        index.solve(specs).map(|result| {
+            result
+                .iter()
+                .map(|(_, record)| record.to_string())
+                .sorted()
+                .collect()
+        })
     }
 
     #[test]

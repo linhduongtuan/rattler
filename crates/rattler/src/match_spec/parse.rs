@@ -325,7 +325,7 @@ fn parse(input: &str, channel_config: &ChannelConfig) -> Result<MatchSpec, Parse
             if version_str.starts_with("==") && build_str.is_none() {
                 Cow::Borrowed(&version_str[2..])
             } else if !version_rest.contains(['=', ',', '|']) {
-                if build_str.is_none() && !version_str.ends_with("*") {
+                if build_str.is_none() && !version_rest.ends_with("*") {
                     Cow::Owned(format!("{}*", version_rest))
                 } else {
                     Cow::Borrowed(version_rest)

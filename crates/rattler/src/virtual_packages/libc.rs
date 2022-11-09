@@ -5,7 +5,6 @@ use std::{
     os::raw::c_int,
     str::FromStr,
 };
-use tracing::log;
 
 mod ffi {
     use std::os::raw::{c_char, c_int};
@@ -36,7 +35,7 @@ pub fn detect_libc_version() -> Option<(String, Version)> {
     let version = match Version::from_str(version) {
         Ok(version) => version,
         Err(e) => {
-            log::warn!("unable to parse libc version: {e}");
+            tracing::warn!("unable to parse libc version: {e}");
             return None;
         }
     };
@@ -45,7 +44,7 @@ pub fn detect_libc_version() -> Option<(String, Version)> {
     // version refers to that of uClibc.
     if family == "NPTL" {
         let family = String::from("uClibc");
-        log::warn!(
+        tracing::warn!(
             "failed to detect non-glibc family, assuming {} ({})",
             &family,
             &version

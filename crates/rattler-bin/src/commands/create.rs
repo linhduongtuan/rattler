@@ -1,3 +1,4 @@
+use comfy_table::{Cell, Color};
 use rattler::repo_data::OwnedLazyRepoData;
 use rattler::solver::Index;
 use rattler::{
@@ -52,44 +53,52 @@ pub async fn create(opt: Opt) -> anyhow::Result<()> {
     // Error out if fetching one of the sources resulted in an error.
     let repo_data = repo_data_per_source
         .into_iter()
-        .map(|(channel, _, result)| result.map(|data| (channel, data)))
+        .map(|(channel, platform, result)| result.map(|data| (channel, platform, data)))
         .collect::<Result<Vec<_>, _>>()?;
 
     // Construct an index
     let mut index = Index::new(
         repo_data
-            .iter()
-            .map(|(_c, repo_data)| repo_data.repo_data()),
+            .into_iter()
+            .map(|(c, platform, repo_data)| ((c, platform), repo_data)),
         channel_config.clone(),
     );
 
     // Add virtual packages
     for package in DETECTED_VIRTUAL_PACKAGES.iter() {
-        index.add_package(package.clone().into());
+        index.add_virtual_package(package.clone().into());
     }
 
-    match index.solve(specs) {
+    // Call the solver
+    let result = match index.solve(specs) {
         Err(e) => {
-            eprintln!("Failed to solve:\n{e}");
+            return Err(anyhow::anyhow!("Failed to solve: \n{e}"));
         }
         Ok(mut result) => {
-            result.sort_by(|a, b| a.name.cmp(&b.name));
-            for result in result {
-                eprintln!("{result}");
-            }
+            result.sort_by(|(_, a), (_, b)| a.name.cmp(&b.name));
+            result
         }
-    }
+    };
 
-    // let solver_problem = SolverProblem {
-    //     channels: repo_data
-    //         .iter()
-    //         .map(|(channel, repodata)| (channel.base_url().to_string(), repodata))
-    //         .collect(),
-    //     specs,
-    // };
-    //
-    // let result = solver_problem.solve()?;
-    // println!("{:#?}", result);
+    // Print a table with everything we are going to install
+    let mut table = comfy_table::Table::new();
+    table
+        .load_preset("     ──            ")
+        .set_header(vec!["Package", "Version", "Build", "Channel", "Size"])
+        .add_rows(result.iter().map(|((channel, platform), record)| {
+            vec![
+                Cell::new(&record.name).fg(Color::DarkGreen),
+                Cell::new(&record.version),
+                Cell::new(&record.build),
+                Cell::new(format!("{}/{}", channel.canonical_name(), platform)),
+                Cell::new(record.size.map_or_else(
+                    || String::from("?"),
+                    |bytes| human_bytes::human_bytes(bytes as f64),
+                )),
+            ]
+        }));
+
+    println!("{table}");
 
     Ok(())
 }
