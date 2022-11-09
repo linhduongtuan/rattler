@@ -21,7 +21,22 @@ use std::{
     fmt::{Debug, Display, Formatter},
 };
 
+const ROOT_NAME: &str = "__ROOT__";
+
 /// A complete set of all versions and variants of a single package.
+///
+/// A package in Conda has one or more entries these entries. Each entry of a single package is
+/// called a variant. The `PackageVariants` struct holds a set of all available variants for a
+/// single package. Each variant is represented by a `PackageVariantId`.
+///
+/// `PackageVariants` also holds an strict ordering of its variants which is used by the solver to
+/// select the "best" variant. See [`Index::variants_order`] lazily computes and caches this order.
+///
+/// The [`Index::dependencies`] method can be used to return the dependencies of each variant.
+///
+/// Its also possible to compute a subset of this instance that only "selects" the variants that
+/// match a certain matchspec. This subset is represented by a `PackageVariantsSubset` and is
+/// computed using the [`PackageVariants::subset_from_matchspec`] method.
 struct PackageVariants {
     name: String,
 
@@ -29,14 +44,15 @@ struct PackageVariants {
     variants: Vec<PackageRecord>,
 
     /// The order of variants when sorted according to resolver rules
-    by_order: OnceCell<Vec<usize>>,
+    solver_order: OnceCell<Vec<usize>>,
 
     /// List of dependencies of a specific record
     dependencies: Vec<OnceCell<Vec<MatchSpec>>>,
 }
 
 impl PackageVariants {
-    pub fn range_from_matchspec(self: Rc<Self>, match_spec: &MatchSpec) -> PackageVariantSet {
+    /// Computes a subset of variants that match a certain [`MatchSpec`].
+    pub fn subset_from_matchspec(self: Rc<Self>, match_spec: &MatchSpec) -> PackageVariantsSubset {
         // Construct a bitset that includes
         let mut included = BitVec::from_elem(self.variants.len(), false);
         for (idx, variant) in self.variants.iter().enumerate() {
@@ -46,23 +62,23 @@ impl PackageVariants {
         }
 
         if included.none() {
-            PackageVariantSet::Empty
+            PackageVariantsSubset::Empty
         } else if included.all() {
-            PackageVariantSet::Full
+            PackageVariantsSubset::Full
         } else {
-            PackageVariantSet::Discrete(PackageVariantRange {
+            PackageVariantsSubset::Discrete(PackageVariantBitset {
                 version_set: self,
                 included,
             })
         }
     }
 
-    /// Returns the number of variants that match the given `PackageVariantSet`.
-    pub fn available_variant_count_in_range(&self, range: &PackageVariantSet) -> usize {
+    /// Returns the number of variants contained within the given `PackageVariantsSubset`.
+    pub fn subset_size(&self, range: &PackageVariantsSubset) -> usize {
         match range {
-            PackageVariantSet::Empty => 0,
-            PackageVariantSet::Full => self.variants.len(),
-            PackageVariantSet::Discrete(discrete) => discrete
+            PackageVariantsSubset::Empty => 0,
+            PackageVariantsSubset::Full => self.variants.len(),
+            PackageVariantsSubset::Discrete(discrete) => discrete
                 .included
                 .blocks()
                 .map(|b| b.count_ones())
@@ -71,133 +87,129 @@ impl PackageVariants {
     }
 }
 
+/// Represents a single variant within a `PackageVariants`.
 #[derive(Clone)]
-pub struct VariantId {
+pub struct PackageVariantId {
     version_set: Rc<PackageVariants>,
     index: usize,
 }
 
-impl VariantId {
+impl PackageVariantId {
+    /// Returns the name of the package of the variant.
     pub fn name(&self) -> &str {
         &self.version_set.name
     }
 }
 
-impl Debug for VariantId {
+impl Debug for PackageVariantId {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        let variants = &self.version_set.variants;
-        write!(f, "{}", &variants[self.index])
+        write!(f, "{}#{}", self.name(), self.index)
     }
 }
 
-impl Display for VariantId {
+impl Display for PackageVariantId {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        let variants = &&self.version_set.variants;
-        write!(f, "{}", &variants[self.index])
+        let variant = &self.version_set.variants[self.index];
+        if variant.name == ROOT_NAME {
+            write!(f, "the environment")
+        } else {
+            write!(f, "{}", variant)
+        }
     }
 }
 
-impl PartialEq for VariantId {
+impl PartialEq for PackageVariantId {
     fn eq(&self, other: &Self) -> bool {
         debug_assert!(Rc::ptr_eq(&self.version_set, &other.version_set));
         self.index == other.index
     }
 }
 
-impl Eq for VariantId {}
+impl Eq for PackageVariantId {}
 
-impl PartialOrd for VariantId {
+impl PartialOrd for PackageVariantId {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         debug_assert!(Rc::ptr_eq(&self.version_set, &other.version_set));
         self.index.partial_cmp(&other.index)
     }
 }
 
-impl Ord for VariantId {
+impl Ord for PackageVariantId {
     fn cmp(&self, other: &Self) -> Ordering {
         debug_assert!(Rc::ptr_eq(&self.version_set, &other.version_set));
         self.index.cmp(&other.index)
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-enum PackageVariantSet {
-    Empty,
-    Full,
-    Discrete(PackageVariantRange),
-}
-
-impl Display for PackageVariantSet {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        match self {
-            PackageVariantSet::Empty => write!(f, "!"),
-            PackageVariantSet::Full => write!(f, "*"),
-            PackageVariantSet::Discrete(discrete) => write!(f, "{}", discrete),
-        }
-    }
-}
-
 #[derive(Clone)]
-struct PackageVariantRange {
+struct PackageVariantBitset {
     version_set: Rc<PackageVariants>,
     included: BitVec,
 }
 
-impl PackageVariantRange {
+impl PackageVariantBitset {
+    /// Returns true if the given variant is contained within this instance.
     #[inline]
-    pub fn contains_variant_index(&self, idx: usize) -> bool {
+    pub fn contains(&self, id: &PackageVariantId) -> bool {
+        self.contains_index(id.index)
+    }
+
+    /// Returns true if the given variant index is contained within this instance.
+    #[inline]
+    pub fn contains_index(&self, index: usize) -> bool {
         self.included
-            .get(idx)
+            .get(index)
             .expect("could not sample outside of available package versions")
     }
 }
 
-impl Debug for PackageVariantRange {
+impl Debug for PackageVariantBitset {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("DiscretePackageVersionRange")
+        f.debug_struct("PackageVariantBitset")
             .field("version_set", &self.version_set.name)
             .field("included", &self.included)
             .finish()
     }
 }
 
-impl Display for PackageVariantRange {
+impl Display for PackageVariantBitset {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        let versions = self
-            .included
-            .iter()
-            .enumerate()
-            .filter_map(|(index, selected)| {
-                if selected {
-                    Some(self.version_set.variants[index].to_string())
-                } else {
-                    None
-                }
-            })
-            .join(", ");
-        write!(f, "{}", versions)
+        // let versions = self
+        //     .included
+        //     .iter()
+        //     .enumerate()
+        //     .filter_map(|(index, selected)| {
+        //         if selected {
+        //             Some(self.version_set.variants[index].to_string())
+        //         } else {
+        //             None
+        //         }
+        //     })
+        //     .join(", ");
+        // write!(f, "{}", versions)
+        write!(f, "?")
     }
 }
 
-impl PartialEq for PackageVariantRange {
+impl PartialEq for PackageVariantBitset {
     fn eq(&self, other: &Self) -> bool {
         self.included.eq(&other.included)
     }
 }
 
-impl Eq for PackageVariantRange {}
+impl Eq for PackageVariantBitset {}
 
-impl From<PackageVariantRange> for PackageVariantSet {
-    fn from(range: PackageVariantRange) -> Self {
-        PackageVariantSet::Discrete(range)
+impl From<PackageVariantBitset> for PackageVariantsSubset {
+    fn from(range: PackageVariantBitset) -> Self {
+        PackageVariantsSubset::Discrete(range)
     }
 }
 
-impl PackageVariantRange {
-    pub fn singleton(v: VariantId) -> Self {
+impl PackageVariantBitset {
+    pub fn singleton(v: PackageVariantId) -> Self {
         let mut included = BitVec::from_elem(v.version_set.variants.len(), false);
         included.set(v.index, true);
-        PackageVariantRange {
+        PackageVariantBitset {
             version_set: v.version_set,
             included,
         }
@@ -213,18 +225,35 @@ impl PackageVariantRange {
     }
 }
 
-impl PackageVariantSet {
-    pub fn contains_variant_index(&self, idx: usize) -> bool {
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum PackageVariantsSubset {
+    Empty,
+    Full,
+    Discrete(PackageVariantBitset),
+}
+
+impl Display for PackageVariantsSubset {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
-            PackageVariantSet::Empty => false,
-            PackageVariantSet::Full => true,
-            PackageVariantSet::Discrete(discrete) => discrete.contains_variant_index(idx),
+            PackageVariantsSubset::Empty => write!(f, "!"),
+            PackageVariantsSubset::Full => write!(f, "*"),
+            PackageVariantsSubset::Discrete(discrete) => write!(f, "{}", discrete),
         }
     }
 }
 
-impl VersionSet for PackageVariantSet {
-    type V = VariantId;
+impl PackageVariantsSubset {
+    fn contains_index(&self, index: usize) -> bool {
+        match self {
+            PackageVariantsSubset::Empty => false,
+            PackageVariantsSubset::Full => true,
+            PackageVariantsSubset::Discrete(bitset) => bitset.contains_index(index),
+        }
+    }
+}
+
+impl VersionSet for PackageVariantsSubset {
+    type V = PackageVariantId;
 
     fn empty() -> Self {
         Self::Empty
@@ -235,33 +264,35 @@ impl VersionSet for PackageVariantSet {
     }
 
     fn singleton(v: Self::V) -> Self {
-        PackageVariantRange::singleton(v).into()
+        PackageVariantBitset::singleton(v).into()
     }
 
     fn complement(&self) -> Self {
         match self {
-            PackageVariantSet::Empty => PackageVariantSet::Full,
-            PackageVariantSet::Full => PackageVariantSet::Empty,
-            PackageVariantSet::Discrete(discrete) => {
-                PackageVariantSet::Discrete(discrete.complement())
+            PackageVariantsSubset::Empty => PackageVariantsSubset::Full,
+            PackageVariantsSubset::Full => PackageVariantsSubset::Empty,
+            PackageVariantsSubset::Discrete(discrete) => {
+                PackageVariantsSubset::Discrete(discrete.complement())
             }
         }
     }
 
     fn intersection(&self, other: &Self) -> Self {
         match (self, other) {
-            (PackageVariantSet::Empty, _) | (_, PackageVariantSet::Empty) => {
-                PackageVariantSet::Empty
+            (PackageVariantsSubset::Empty, _) | (_, PackageVariantsSubset::Empty) => {
+                PackageVariantsSubset::Empty
             }
-            (PackageVariantSet::Full, other) | (other, PackageVariantSet::Full) => other.clone(),
-            (PackageVariantSet::Discrete(a), PackageVariantSet::Discrete(b)) => {
+            (PackageVariantsSubset::Full, other) | (other, PackageVariantsSubset::Full) => {
+                other.clone()
+            }
+            (PackageVariantsSubset::Discrete(a), PackageVariantsSubset::Discrete(b)) => {
                 debug_assert!(Rc::ptr_eq(&a.version_set, &b.version_set));
                 let mut included = a.included.clone();
                 included.and(&b.included);
                 if included.none() {
-                    PackageVariantSet::Empty
+                    PackageVariantsSubset::Empty
                 } else {
-                    PackageVariantRange {
+                    PackageVariantBitset {
                         version_set: a.version_set.clone(),
                         included,
                     }
@@ -272,21 +303,29 @@ impl VersionSet for PackageVariantSet {
     }
 
     fn contains(&self, v: &Self::V) -> bool {
-        self.contains_variant_index(v.index)
+        match self {
+            PackageVariantsSubset::Empty => false,
+            PackageVariantsSubset::Full => true,
+            PackageVariantsSubset::Discrete(bitset) => bitset.contains(v),
+        }
     }
 
     fn union(&self, other: &Self) -> Self {
         match (self, other) {
-            (PackageVariantSet::Empty, other) | (other, PackageVariantSet::Empty) => other.clone(),
-            (PackageVariantSet::Full, _) | (_, PackageVariantSet::Full) => PackageVariantSet::Full,
-            (PackageVariantSet::Discrete(a), PackageVariantSet::Discrete(b)) => {
+            (PackageVariantsSubset::Empty, other) | (other, PackageVariantsSubset::Empty) => {
+                other.clone()
+            }
+            (PackageVariantsSubset::Full, _) | (_, PackageVariantsSubset::Full) => {
+                PackageVariantsSubset::Full
+            }
+            (PackageVariantsSubset::Discrete(a), PackageVariantsSubset::Discrete(b)) => {
                 debug_assert!(Rc::ptr_eq(&a.version_set, &b.version_set));
                 let mut included = a.included.clone();
                 included.or(&b.included);
                 if included.all() {
-                    PackageVariantSet::Full
+                    PackageVariantsSubset::Full
                 } else {
-                    PackageVariantRange {
+                    PackageVariantBitset {
                         version_set: a.version_set.clone(),
                         included,
                     }
@@ -329,13 +368,13 @@ impl<'i> Index<'i> {
         &self,
         specs: impl IntoIterator<Item = MatchSpec>,
     ) -> Result<Vec<PackageRecord>, String> {
-        let root_package_name = String::from("__ROOT__");
+        let root_package_name = ROOT_NAME.to_owned();
         let root_version = Version::from_str("0").unwrap();
 
         // Create variants (just the one) for the root
         let root_package_variant_set = Rc::new(PackageVariants {
             name: root_package_name.clone(),
-            by_order: Default::default(),
+            solver_order: Default::default(),
             dependencies: vec![OnceCell::with_value(specs.into_iter().collect())],
             variants: vec![PackageRecord::new(
                 root_package_name,
@@ -352,7 +391,7 @@ impl<'i> Index<'i> {
         );
 
         // Construct a single version of the root package (the only one)
-        let root_package_variant = VariantId {
+        let root_package_variant = PackageVariantId {
             version_set: root_package_variant_set.clone(),
             index: 0,
         };
@@ -390,10 +429,10 @@ impl<'i> Index<'i> {
     }
 
     /// Adds a virtual package to the index
-    pub fn add_package(&mut self, package: PackageRecord) -> VariantId {
+    pub fn add_package(&mut self, package: PackageRecord) -> PackageVariantId {
         let set = Rc::new(PackageVariants {
             name: package.name.clone(),
-            by_order: Default::default(),
+            solver_order: Default::default(),
             dependencies: vec![Default::default()],
             variants: vec![package],
         });
@@ -406,7 +445,7 @@ impl<'i> Index<'i> {
             panic!("duplicate package entry for `{}`", previous_package.name);
         }
 
-        VariantId {
+        PackageVariantId {
             version_set: set,
             index: 0,
         }
@@ -437,7 +476,7 @@ impl<'i> Index<'i> {
 
             let set = Rc::new(PackageVariants {
                 name: package.clone(),
-                by_order: Default::default(),
+                solver_order: Default::default(),
                 dependencies: (0..variants.len()).map(|_| Default::default()).collect(),
                 variants,
             });
@@ -454,7 +493,7 @@ impl<'i> Index<'i> {
 
     /// Returns a vec that indicates the order of package variants.
     fn variants_order<'v>(&self, variants: &'v PackageVariants) -> &'v Vec<usize> {
-        variants.by_order.get_or_init(|| {
+        variants.solver_order.get_or_init(|| {
             let mut result = (0..variants.variants.len()).collect_vec();
             result.sort_by(|&a, &b| self.compare_variants(variants, a, b));
 
@@ -626,17 +665,19 @@ impl<'i> Index<'i> {
     }
 }
 
-impl<'i> pubgrub::solver::DependencyProvider<String, PackageVariantSet> for Index<'i> {
-    fn choose_package_version<T: Borrow<String>, U: Borrow<PackageVariantSet>>(
+impl<'i> pubgrub::solver::DependencyProvider<String, PackageVariantsSubset> for Index<'i> {
+    fn choose_package_version<T: Borrow<String>, U: Borrow<PackageVariantsSubset>>(
         &self,
         potential_packages: impl Iterator<Item = (T, U)>,
-    ) -> Result<(T, Option<VariantId>), Box<dyn Error>> {
+    ) -> Result<(T, Option<PackageVariantId>), Box<dyn Error>> {
         let mut min_dependency_count = usize::MAX;
         let mut min_package = None;
+        let mut num_packages = 0;
         for (package, range) in potential_packages {
+            num_packages = num_packages + 1;
             let variants = self.package_variants(package.borrow())?;
-            let count = variants.available_variant_count_in_range(range.borrow());
-            if count < min_dependency_count {
+            let count = variants.subset_size(range.borrow());
+            if count < min_dependency_count && count > 0 {
                 min_package = Some((package, variants, range));
                 min_dependency_count = count;
             }
@@ -644,10 +685,10 @@ impl<'i> pubgrub::solver::DependencyProvider<String, PackageVariantSet> for Inde
 
         if let Some((package, variants, range)) = min_package {
             for &variant_idx in self.variants_order(&variants).iter() {
-                if range.borrow().contains_variant_index(variant_idx) {
+                if range.borrow().contains_index(variant_idx) {
                     return Ok((
                         package,
-                        Some(VariantId {
+                        Some(PackageVariantId {
                             version_set: variants.clone(),
                             index: variant_idx,
                         }),
@@ -656,19 +697,25 @@ impl<'i> pubgrub::solver::DependencyProvider<String, PackageVariantSet> for Inde
             }
         }
 
+        dbg!(
+            "could not select any packages",
+            num_packages,
+            min_dependency_count
+        );
         // for (package, range) in potential_packages {
-        //     let variants = self.package_variants(package.borrow())?;
-        //     for &variant_idx in self.variants_order(&variants).iter() {
-        //         if range.borrow().contains_variant_index(variant_idx) {
-        //             return Ok((
-        //                 package,
-        //                 Some(VariantId {
-        //                     version_set: variants.clone(),
-        //                     index: variant_idx,
-        //                 }),
-        //             ));
-        //         }
+        //     dbg!(package.borrow());
+        // let variants = self.package_variants(package.borrow())?;
+        // for &variant_idx in self.variants_order(&variants).iter() {
+        //     if range.borrow().contains_variant_index(variant_idx) {
+        //         return Ok((
+        //             package,
+        //             Some(VariantId {
+        //                 version_set: variants.clone(),
+        //                 index: variant_idx,
+        //             }),
+        //         ));
         //     }
+        // }
         // }
 
         Err(anyhow::anyhow!("no packages found that can be chosen").into())
@@ -677,13 +724,13 @@ impl<'i> pubgrub::solver::DependencyProvider<String, PackageVariantSet> for Inde
     fn get_dependencies(
         &self,
         package: &String,
-        version: &VariantId,
-    ) -> Result<Dependencies<String, PackageVariantSet>, Box<dyn Error>> {
+        version: &PackageVariantId,
+    ) -> Result<Dependencies<String, PackageVariantsSubset>, Box<dyn Error>> {
         debug_assert!(package == &version.version_set.name);
         let record = &version.version_set.variants[version.index];
         let dependencies = self.dependencies(&version.version_set, version.index)?;
 
-        let mut result: DependencyConstraints<String, Requirement<PackageVariantSet>> =
+        let mut result: DependencyConstraints<String, Requirement<PackageVariantsSubset>> =
             DependencyConstraints::default();
 
         for constraint in record.constrains.iter() {
@@ -694,7 +741,7 @@ impl<'i> pubgrub::solver::DependencyProvider<String, PackageVariantSet> for Inde
                 .expect("matchspec without package name");
 
             let version_set = self.package_variants(name)?;
-            let range = version_set.range_from_matchspec(&match_spec);
+            let range = version_set.subset_from_matchspec(&match_spec);
 
             result
                 .entry(name.clone())
@@ -717,13 +764,18 @@ impl<'i> pubgrub::solver::DependencyProvider<String, PackageVariantSet> for Inde
                 if version_set.name.starts_with("__") {
                     return Ok(Dependencies::Unknown);
                 } else {
-                    return Err(anyhow::anyhow!("no entries found for package `{}`", name).into());
+                    tracing::warn!(
+                        "{} has invalid dependency: could not find package entry for '{name}'",
+                        version
+                    );
+                    return Ok(Dependencies::Unknown);
+                    // return Err(anyhow::anyhow!("no entries found for package `{}`", name).into());
                 }
             }
 
-            let range = version_set.range_from_matchspec(match_spec);
+            let range = version_set.subset_from_matchspec(match_spec);
 
-            result
+            let requirement = result
                 .entry(name.clone())
                 .and_modify(|spec| {
                     *spec = Requirement::Required(match spec {
@@ -732,6 +784,15 @@ impl<'i> pubgrub::solver::DependencyProvider<String, PackageVariantSet> for Inde
                     });
                 })
                 .or_insert_with(|| Requirement::Required(range));
+
+            let range = match requirement {
+                Requirement::Required(range) | Requirement::Constrained(range) => range,
+            };
+
+            if range == &PackageVariantsSubset::empty() {
+                tracing::warn!("{} has invalid dependency: the version range doesnt match any package for '{name}'", version);
+                return Ok(Dependencies::Unknown);
+            }
         }
 
         Ok(Dependencies::Known(result))
