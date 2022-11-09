@@ -693,7 +693,7 @@ impl<C: Clone, P: PackageRecordProvider>
         let mut min_package = None;
         let mut num_packages = 0;
         for (package, range) in potential_packages {
-            num_packages = num_packages + 1;
+            num_packages += 1;
             let variants = self.package_variants(package.borrow())?;
             let count = variants.subset_size(range.borrow());
             if count < min_dependency_count && count > 0 {

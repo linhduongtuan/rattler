@@ -321,11 +321,11 @@ fn parse(input: &str, channel_config: &ChannelConfig) -> Result<MatchSpec, Parse
         // '=1.2.3'
         let version_str = if version_str == "==" {
             Cow::Borrowed(version_str)
-        } else if let Some(version_rest) = version_str.strip_prefix("=") {
+        } else if let Some(version_rest) = version_str.strip_prefix('=') {
             if version_str.starts_with("==") && build_str.is_none() {
                 Cow::Borrowed(&version_str[2..])
             } else if !version_rest.contains(['=', ',', '|']) {
-                if build_str.is_none() && !version_rest.ends_with("*") {
+                if build_str.is_none() && !version_rest.ends_with('*') {
                     Cow::Owned(format!("{}*", version_rest))
                 } else {
                     Cow::Borrowed(version_rest)
