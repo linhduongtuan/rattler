@@ -1,4 +1,4 @@
-name: a
+name: c
 channels:
   - conda-forge
 dependencies:
