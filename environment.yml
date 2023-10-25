@@ -1,4 +1,4 @@
-name: rattler-env
+name: a
 channels:
   - conda-forge
 dependencies:
